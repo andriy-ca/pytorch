@@ -431,8 +431,9 @@ void ormqr<c10::complex<double>>(
     CUDASOLVER_ORMQR_ARGTYPES(c10::complex<double>));
 
 #if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
-// get_cusolver_datatype is needed on CUDA (for xpotrf/xgeqrf/xsyevd) and on
-// ROCm (for xsytrs used by ldl_solve), so keep it outside USE_CUSOLVER_64_BIT.
+// get_cusolver_datatype is needed on CUDA (for xpotrf/xgeqrf/xsyevd, which
+// require USE_CUSOLVER_64_BIT) and on ROCm (for xsytrs used by ldl_solve).
+// On ROCm, USE_CUSOLVER_64_BIT is not defined, so USE_ROCM is used to enable it.
 template<class Dtype>
 cudaDataType get_cusolver_datatype() {
   static_assert(false&&sizeof(Dtype), "cusolver doesn't support data type");
