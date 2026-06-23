@@ -445,7 +445,7 @@ template<> cudaDataType get_cusolver_datatype<c10::complex<float>>();
 template<> cudaDataType get_cusolver_datatype<c10::complex<double>>();
 #endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
 
-#ifdef USE_CUSOLVER_64_BIT
+#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
 
 void xpotrf_buffersize(
     cusolverDnHandle_t handle, cusolverDnParams_t params, cublasFillMode_t uplo, int64_t n, cudaDataType dataTypeA, const void *A,
@@ -460,7 +460,7 @@ void xpotrs(
     cusolverDnHandle_t handle, cusolverDnParams_t params, cublasFillMode_t uplo, int64_t n, int64_t nrhs, cudaDataType dataTypeA, const void *A,
     int64_t lda, cudaDataType dataTypeB, void *B, int64_t ldb, int *info);
 
-#endif // USE_CUSOLVER_64_BIT
+#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
 
 #define CUDASOLVER_SYEVD_BUFFERSIZE_ARGTYPES(scalar_t, value_t)             \
   cusolverDnHandle_t handle, cusolverEigMode_t jobz, cublasFillMode_t uplo, \
@@ -554,7 +554,7 @@ template <>
 void syevjBatched<c10::complex<double>, double>(
     CUDASOLVER_SYEVJ_BATCHED_ARGTYPES(c10::complex<double>, double));
 
-#ifdef USE_CUSOLVER_64_BIT
+#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
 
 #define CUDASOLVER_XGEQRF_BUFFERSIZE_ARGTYPES(scalar_t)                       \
   cusolverDnHandle_t handle, cusolverDnParams_t params, int64_t m, int64_t n, \
@@ -650,7 +650,7 @@ template <>
 void xsyevd<c10::complex<double>, double>(
     CUDASOLVER_XSYEVD_ARGTYPES(c10::complex<double>, double));
 
-#endif // USE_CUSOLVER_64_BIT
+#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
 
 // cuSOLVER Xgeev (non-Hermitian eigen decomposition, CUDA >= 12.8)
 #if (defined(CUSOLVER_VERSION) && (CUSOLVER_VERSION >= 11702)) || (defined(USE_ROCM) && ROCM_VERSION >= 71400)
@@ -710,7 +710,7 @@ void xgeev<c10::complex<double>>(CUDASOLVER_XGEEV_ARGTYPES(c10::complex<double>)
 
 #endif // (defined(CUSOLVER_VERSION) && (CUSOLVER_VERSION >= 11702)) || (defined(USE_ROCM) && ROCM_VERSION >= 71400)
 
-#ifdef USE_CUSOLVER_64_BIT_XSYEV_BATCHED
+#if defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED) || defined(USE_ROCM)
 
 #define CUDASOLVER_XSYEV_BATCHED_BUFFERSIZE_ARGTYPES(scalar_t, value_t) \
     cusolverDnHandle_t handle,                                          \
@@ -786,7 +786,7 @@ template <>
 void xsyevBatched<c10::complex<double>, double>(
     CUDASOLVER_XSYEV_BATCHED_ARGTYPES(c10::complex<double>, double));
 
-#endif // USE_CUSOLVER_64_BIT_XSYEV_BATCHED
+#endif // defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED) || defined(USE_ROCM)
 
 } // namespace solver
 } // namespace cuda
