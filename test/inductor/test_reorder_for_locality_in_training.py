@@ -1,12 +1,7 @@
 # Owner(s): ["module: inductor"]
-"""Tests for ``torch._inductor.config.reorder_for_locality_in_training``.
-
-The flag reads ``TORCHINDUCTOR_REORDER_LOCALITY_TRAINING`` at module
-import time, so we test the runtime gating in
-``torch._inductor.fx_passes.post_grad`` by patching the flag directly
-(``torch._inductor.config.patch``). We also exercise the env path with
-a subprocess.
-"""
+"""Tests for the reorder_for_locality_in_training flag: env parsing, and that on
+a real fwd+bwd training graph the flag reorders a node without changing
+grads/params."""
 
 import os
 import subprocess
@@ -14,119 +9,135 @@ import sys
 from unittest.mock import patch as mock_patch
 
 import torch
+import torch._dynamo
 import torch._inductor.config as inductor_config
-import torch.fx as fx
+from torch._inductor.fx_passes import post_grad
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 
-class TestReorderForLocalityInTraining(TestCase):
-    def test_default_off(self):
-        # The default-off statement is what we ship: importing config with
-        # the env unset should leave the flag False.
-        env = os.environ.copy()
+def _flag_in_subprocess(env_value):
+    # Parse-only: a fresh interpreter imports just the config module and prints
+    # the resolved flag. env_value=None means the var is unset (ship default).
+    env = os.environ.copy()
+    if env_value is None:
         env.pop("TORCHINDUCTOR_REORDER_LOCALITY_TRAINING", None)
-        out = (
-            subprocess.check_output(
-                [
-                    sys.executable,
-                    "-c",
-                    "import torch._inductor.config as c; print(int(c.reorder_for_locality_in_training))",
-                ],
-                env=env,
-            )
-            .decode()
-            .strip()
-        )
-        self.assertEqual(out, "0")
+    else:
+        env["TORCHINDUCTOR_REORDER_LOCALITY_TRAINING"] = env_value
+    out = subprocess.check_output(
+        [
+            sys.executable,
+            "-c",
+            "import torch._inductor.config as c;"
+            "print(int(c.reorder_for_locality_in_training))",
+        ],
+        env=env,
+    )
+    return out.decode().strip()
+
+
+class _Recorder:
+    """Wraps ``reorder_for_locality`` and records, per call, whether the pass
+    changed the graph node order. ``orig`` is captured before patching so the
+    real pass still runs."""
+
+    def __init__(self):
+        self.orig = post_grad.reorder_for_locality
+        self.calls = 0
+        self.moved = False
+
+    def __call__(self, graph):
+        before = [n.name for n in graph.nodes]
+        self.orig(graph)
+        after = [n.name for n in graph.nodes]
+        self.calls += 1
+        if before != after:
+            self.moved = True
+
+
+class _TwoBranch(torch.nn.Module):
+    # Two independent matmul branches that only meet at the end. After
+    # functionalization the branch producers land far from their sole
+    # consumers, so reorder_for_locality has real moves to make.
+    def __init__(self):
+        super().__init__()
+        self.w1 = torch.nn.Parameter(torch.randn(16, 16))
+        self.w2 = torch.nn.Parameter(torch.randn(16, 16))
+
+    def forward(self, x):
+        a = torch.tanh(x @ self.w1)
+        b = torch.sigmoid(x @ self.w2)
+        return (a * b + torch.sin(a) * torch.cos(b)).sum(dim=1)
+
+
+def _train_once(flag_on):
+    rec = _Recorder()
+    torch._dynamo.reset()
+    torch.manual_seed(1234)
+    model = _TwoBranch()
+    x = torch.randn(8, 16)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with inductor_config.patch(
+        {
+            "reorder_for_locality_in_training": flag_on,
+            "fx_graph_cache": False,
+            "force_disable_caches": True,
+        }
+    ):
+        with mock_patch.object(post_grad, "reorder_for_locality", rec):
+            compiled = torch.compile(model, backend="inductor", fullgraph=True)
+            compiled(x).sum().backward()
+    grads = {n: p.grad.detach().clone() for n, p in model.named_parameters()}
+    opt.step()
+    params = {n: p.detach().clone() for n, p in model.named_parameters()}
+    return params, grads, rec
+
+
+class TestReorderForLocalityInTrainingEnv(TestCase):
+    def test_default_off(self):
+        self.assertEqual(_flag_in_subprocess(None), "0")
 
     def test_env_one_turns_on(self):
-        env = os.environ.copy()
-        env["TORCHINDUCTOR_REORDER_LOCALITY_TRAINING"] = "1"
-        out = (
-            subprocess.check_output(
-                [
-                    sys.executable,
-                    "-c",
-                    "import torch._inductor.config as c; print(int(c.reorder_for_locality_in_training))",
-                ],
-                env=env,
-            )
-            .decode()
-            .strip()
-        )
-        self.assertEqual(out, "1")
+        self.assertEqual(_flag_in_subprocess("1"), "1")
 
     def test_env_zero_keeps_off(self):
-        env = os.environ.copy()
-        env["TORCHINDUCTOR_REORDER_LOCALITY_TRAINING"] = "0"
-        out = (
-            subprocess.check_output(
-                [
-                    sys.executable,
-                    "-c",
-                    "import torch._inductor.config as c; print(int(c.reorder_for_locality_in_training))",
-                ],
-                env=env,
-            )
-            .decode()
-            .strip()
+        self.assertEqual(_flag_in_subprocess("0"), "0")
+
+
+class TestReorderForLocalityInTraining(TestCase):
+    def test_training_flag_reorders_and_preserves_semantics(self):
+        p_off, g_off, rec_off = _train_once(flag_on=False)
+        p_on, g_on, rec_on = _train_once(flag_on=True)
+
+        # (a) semantics preserved: same seed/init/input, so grads and the
+        # post-step params must match exactly between flag-off and flag-on.
+        self.assertEqual(set(g_off), set(g_on))
+        for k in g_off:
+            self.assertEqual(g_on[k], g_off[k], atol=0, rtol=0)
+            self.assertEqual(p_on[k], p_off[k], atol=0, rtol=0)
+
+        # (b) the flag actually exercised the pass: with it on the reorder ran
+        # and moved at least one node on a training graph; with it off the pass
+        # never ran on training. The moved check is what gives this teeth, a
+        # no-op graph would leave moved False and fail here.
+        self.assertEqual(rec_off.calls, 0)
+        self.assertGreater(rec_on.calls, 0)
+        self.assertTrue(
+            rec_on.moved,
+            "flag on must reorder at least one node on the training graph",
         )
-        self.assertEqual(out, "0")
 
-    def _make_tiny_gm(self):
-        g = fx.Graph()
-        x = g.placeholder("x")
-        y = g.call_function(torch.relu, args=(x,))
-        g.output(y)
-        return fx.GraphModule(torch.nn.Module(), g)
-
-    def test_pass_does_not_run_on_training_when_flag_off(self):
-        from torch._inductor.fx_passes import post_grad
-
-        called = {"reorder": False}
-        orig = post_grad.reorder_for_locality
-
-        def _spy(graph):
-            called["reorder"] = True
-            return orig(graph)
-
+    def test_inference_gate_unchanged(self):
+        # Gate-only check (invocation, not a feature exercise): inference graphs
+        # must still run the pass regardless of the training flag.
+        rec = _Recorder()
         with inductor_config.patch({"reorder_for_locality_in_training": False}):
-            with mock_patch.object(post_grad, "reorder_for_locality", _spy):
-                post_grad.post_grad_passes(self._make_tiny_gm(), is_inference=False)
-        self.assertFalse(called["reorder"])
-
-    def test_pass_runs_on_training_when_flag_on(self):
-        from torch._inductor.fx_passes import post_grad
-
-        called = {"reorder": False}
-        orig = post_grad.reorder_for_locality
-
-        def _spy(graph):
-            called["reorder"] = True
-            return orig(graph)
-
-        with inductor_config.patch({"reorder_for_locality_in_training": True}):
-            with mock_patch.object(post_grad, "reorder_for_locality", _spy):
-                post_grad.post_grad_passes(self._make_tiny_gm(), is_inference=False)
-        self.assertTrue(called["reorder"])
-
-    def test_inference_path_unchanged(self):
-        # The pass should still run on inference graphs regardless of the
-        # new flag's value (preserves the existing default-on inference
-        # behaviour).
-        from torch._inductor.fx_passes import post_grad
-
-        called = {"reorder": False}
-        orig = post_grad.reorder_for_locality
-
-        def _spy(graph):
-            called["reorder"] = True
-            return orig(graph)
-
-        with inductor_config.patch({"reorder_for_locality_in_training": False}):
-            with mock_patch.object(post_grad, "reorder_for_locality", _spy):
-                post_grad.post_grad_passes(self._make_tiny_gm(), is_inference=True)
-        self.assertTrue(called["reorder"])
+            with mock_patch.object(post_grad, "reorder_for_locality", rec):
+                g = torch.fx.Graph()
+                xn = g.placeholder("x")
+                g.output(g.call_function(torch.relu, args=(xn,)))
+                gm = torch.fx.GraphModule(torch.nn.Module(), g)
+                post_grad.post_grad_passes(gm, is_inference=True)
+        self.assertGreater(rec.calls, 0)
 
 
 if __name__ == "__main__":
