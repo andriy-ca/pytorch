@@ -71,7 +71,6 @@ from .runtime_utils import (
     get_first_attr,
     get_max_y_grid,
     get_num_bytes,
-    last_power_of_2,
     next_power_of_2,
     triton_cache_dir,
     triton_config_to_hashable,
@@ -1670,8 +1669,24 @@ class CachingAutotuner(KernelInterface):
             timings = {}
             best_launcher = None
             best_timing = float("inf")
-            for launcher in self.launchers:
-                timing = self.bench(launcher, *args, **kwargs)
+            for i, launcher in enumerate(self.launchers):
+                try:
+                    timing = self.bench(launcher, *args, **kwargs)
+                except RuntimeError as e:
+                    cooperative_launch_error = (
+                        "too many blocks in cooperative launch" in str(e)
+                    )
+                    # Cooperative launches deliberately autotune configs that may fail.
+                    # Catch that and continue unless this is the last launcher and we've
+                    # found nothing else.
+                    if cooperative_launch_error and (
+                        best_launcher is not None or i < (len(self.launchers) - 1)
+                    ):
+                        self._close_static_launcher(launcher)
+                        continue
+                    else:
+                        raise
+
                 timings[launcher] = timing
                 # Close losing static launchers eagerly so exhaustive autotuning
                 # keeps only the current winner and candidate modules loaded.
@@ -4895,14 +4910,17 @@ def cooperative_reduction(
             "Cooperative reductions don't support tiling reduction dims"
         )
     xnumel, rnumel = size_hints["x"], size_hints["r0_"]
+    # The xnumel size hint is rounded up to the nearest power of 2.  For a normal
+    # reduction that doesn't matter, but in a cooperative reduction that can result in
+    # spawning completely empty blocks and thus underutilizing the GPU.  inductor_meta
+    # contains the actual xnumel, specifically for this.
+    real_xnumel = inductor_meta.get("real_xnumel", xnumel)
 
-    # Note that we must never create more CTAs than there are SMs, because we
-    # depend on synchronizing between the CTAs in x_grid_barrier, and that will
-    # deadlock if some of the CTAs are not running. In order to maximize use of
-    # the GPU, we want to create as many CTAs as possible, while keeping things
-    # in powers of 2.
-    target = last_power_of_2(triton_meta["device"].multi_processor_count)
-    split = max(1, min((rnumel, target // xnumel, TRITON_MAX_RSPLIT)))
+    def get_valid_rsplit(desired_rsplit: int) -> int:
+        return max(1, min((desired_rsplit, rnumel, TRITON_MAX_RSPLIT)))
+
+    target = triton_meta["device"].multi_processor_count
+    split = get_valid_rsplit(target // real_xnumel)
     if inductor_meta["persistent_reduction"]:
         configs = _persistent_reduction_configs(
             {"x": xnumel, "r0_": rnumel // split},
@@ -4916,9 +4934,24 @@ def cooperative_reduction(
             inductor_meta=inductor_meta,
             triton_meta=triton_meta,
         )
-    for config in configs:
-        config.kwargs["RSPLIT"] = split
-    # TODO(jansel): add more configs in max_autotune
+
+    max_autotune_enabled: bool = inductor_meta.get(
+        "max_autotune", False
+    ) or inductor_meta.get("max_autotune_pointwise", False)
+    for config in list(configs):
+        # If XBLOCK > 1, increase the number of splits to get closer to the target value.
+        xblock: int = config.kwargs["XBLOCK"]
+        xsplit = (real_xnumel + xblock - 1) // xblock
+        updated_split = target // xsplit
+        config.kwargs["RSPLIT"] = get_valid_rsplit(updated_split)
+
+        # Basic guess at max autotune: less complex cooperative reductions can launch
+        # more blocks than SMs, but the APIs for checking aren't useful for Triton.
+        # Try doubling the number of blocks and seeing if it succeeds, but only if we're
+        # not already maxed out.
+        if max_autotune_enabled and config.kwargs["RSPLIT"] == updated_split:
+            configs.append(copy.deepcopy(config))
+            configs[-1].kwargs["RSPLIT"] = get_valid_rsplit(2 * updated_split)
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
