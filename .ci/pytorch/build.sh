@@ -185,6 +185,13 @@ if [[ "$BUILD_ENVIRONMENT" == *cuda* ]] && echo "${TORCH_CUDA_ARCH_LIST}" | tr '
   export BUILD_CUSTOM_STEP="ninja -C build flash_attention -j ${J}"
 fi
 
+# XPU build sycltla require large amounts of meomory to build and will OOM
+if [[ "$BUILD_ENVIRONMENT" == *xpu* ]]; then
+  J=1  # default to 1 jobs
+  echo "Building sycltla with job limit $J"
+  export BUILD_CUSTOM_STEP="ninja -C build -t targets | grep -q torch-xpu-ops-sycltla && ninja -C build torch-xpu-ops-sycltla -j ${J} || echo 'sycltla target not found, skipping'"
+fi
+
 # TODO: Removeme once all the wrappers are gone
 if [[ "$BUILD_ENVIRONMENT" == *clang* ]] && [[ "$BUILD_ENVIRONMENT" == *cuda* ]]; then
   sudo rm -f /opt/cache/bin/clang++
