@@ -37,6 +37,7 @@ from torch._inductor.config import triton as inductor_triton_config
 from torch._prims_common import compute_required_storage_length
 from torch.utils._debug_mode import get_active_debug_mode
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._triton import get_triton_version
 
 from ..triton_bundler import TritonBundler
 from ..utils import (
@@ -117,6 +118,14 @@ class InductorConfig(Config):
 
 class NoTritonConfigsError(RuntimeError):
     pass
+
+
+def _should_enable_triton_debug_asserts(inductor_meta: dict[str, Any]) -> bool:
+    if not inductor_meta.get("assert_indirect_indexing", True):
+        return False
+    if not inductor_meta.get("is_hip", False):
+        return True
+    return get_triton_version() >= (3, 7)
 
 
 if TYPE_CHECKING:
@@ -1144,7 +1153,9 @@ class CachingAutotuner(KernelInterface):
                 cfg, "num_buffers_warp_spec", 0
             )
 
-        compile_meta["debug"] = self.inductor_meta.get("assert_indirect_indexing", True)
+        compile_meta["debug"] = _should_enable_triton_debug_asserts(
+            self.inductor_meta
+        )
 
         # device type will be "hip" rather than "cuda" here
         compile_meta["device_type"] = self.device_props.type
