@@ -362,6 +362,7 @@ dtensor_fails_no_strategy = {
     xfail("histogramdd"),
     xfail("isin"),
     xfail("linalg.matrix_power"),
+    # Full-matrix op; matrix dims can't be sharded, like matrix_exp/matrix_power.
     xfail("linalg.matrix_sqrt"),
     xfail("linspace", "tensor_overload"),
     xfail("log_normal"),
