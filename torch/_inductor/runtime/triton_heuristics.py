@@ -121,6 +121,14 @@ class NoTritonConfigsError(RuntimeError):
 
 
 def _should_enable_triton_debug_asserts(inductor_meta: dict[str, Any]) -> bool:
+    """
+    Enable Triton debug asserts whenever indirect indexing asserts are on,
+    except on HIP where older Triton releases lack the required support.
+
+    Triton 3.7 is the first release that includes the upstream debug-assert
+    support needed by ROCm, so HIP kernels must keep this disabled below that
+    version to remain compatible.
+    """
     if not inductor_meta.get("assert_indirect_indexing", True):
         return False
     if not inductor_meta.get("is_hip", False):
@@ -1153,9 +1161,7 @@ class CachingAutotuner(KernelInterface):
                 cfg, "num_buffers_warp_spec", 0
             )
 
-        compile_meta["debug"] = _should_enable_triton_debug_asserts(
-            self.inductor_meta
-        )
+        compile_meta["debug"] = _should_enable_triton_debug_asserts(self.inductor_meta)
 
         # device type will be "hip" rather than "cuda" here
         compile_meta["device_type"] = self.device_props.type
