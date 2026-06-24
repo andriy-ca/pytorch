@@ -467,6 +467,7 @@
     "multi_dot",
     "norm",
     "pinv",
+    "polar",
     "qr",
     "slogdet",
     "solve",
