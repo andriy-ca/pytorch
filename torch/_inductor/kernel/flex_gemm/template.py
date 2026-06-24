@@ -36,6 +36,9 @@ class FlexGemmEpilogueConfig:
         epilogue_arg_indices: Template input indices for read-only epilogue captures.
         epilogue_arg_kinds: Broadcast kind for each captured epilogue tensor.
         aux_out_index: Template input index for the single supported aux output.
+        local_reduce_out_index: Template input index for the local-reduce aux output.
+        local_reduce_group: Intra-CTA group size for generated local-reduce aux stores.
+        local_reduce_axis: Output axis compressed by the generated local-reduce aux store.
     """
 
     epilogue_name: str
@@ -48,6 +51,9 @@ class FlexGemmEpilogueConfig:
     epilogue_arg_indices: tuple[int, ...] = ()
     epilogue_arg_kinds: tuple[str, ...] = ()
     aux_out_index: int | None = None
+    local_reduce_out_index: int | None = None
+    local_reduce_group: int | None = None
+    local_reduce_axis: int | None = None
 
 
 class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
@@ -182,6 +188,22 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
             )
         if config.aux_out_index is not None:
             kwargs.append(f", aux_out={input_args[config.aux_out_index]}")
+        if config.local_reduce_out_index is not None:
+            local_reduce_kwargs = (
+                f", local_reduce_out={input_args[config.local_reduce_out_index]}, "
+                f"local_reduce_group={config.local_reduce_group!r}, "
+                f"local_reduce_axis={config.local_reduce_axis!r}"
+            )
+            if config.local_reduce_axis == 0 or (
+                config.local_reduce_group is not None and config.local_reduce_group > 32
+            ):
+                local_reduce_kwargs += (
+                    f", local_reduce_combine_fn={config.epilogue_name}_local_reduce_combine_fn, "
+                    f"local_reduce_combine_key={config.epilogue_name + '_local_reduce_combine_fn'!r}, "
+                    f"local_reduce_finalize_fn={config.epilogue_name}_local_reduce_finalize_fn, "
+                    f"local_reduce_finalize_key={config.epilogue_name + '_local_reduce_finalize_fn'!r}"
+                )
+            kwargs.append(local_reduce_kwargs)
         return "".join(kwargs)
 
 

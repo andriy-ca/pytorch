@@ -174,6 +174,11 @@ def dispatch_gemm_act(
     C: torch.Tensor | None,
     out: torch.Tensor,
     aux_out: torch.Tensor | None,
+    local_reduce_out: torch.Tensor | None,
+    local_reduce_group: int | None,
+    local_reduce_axis: int | None,
+    local_reduce_combine_key: str | None,
+    local_reduce_finalize_key: str | None,
     epilogue_key: str,
     epilogue_arg_kinds: tuple[str, ...],
     row_args: tuple[torch.Tensor, ...],
@@ -197,11 +202,21 @@ def dispatch_gemm_act(
 
     # QuACK consumes A as (l, m, k) and B as (l, n, k); b is (k, n) so b.mT is (n, k).
     quack_a, quack_b = a, b.mT
-    quack_out, quack_aux_out, quack_c = out, aux_out, C
+    quack_out, quack_aux_out, quack_local_reduce_out, quack_c = (
+        out,
+        aux_out,
+        local_reduce_out,
+        C,
+    )
     if config.swap_ab:
         quack_a, quack_b = quack_b, quack_a
         quack_out = out.mT
+        if local_reduce_out is not None:
+            raise NotImplementedError(
+                "FlexGEMM local-reduce aux outputs do not support swap_ab configs yet"
+            )
         quack_aux_out = None if aux_out is None else aux_out.mT
+        quack_local_reduce_out = None
         quack_c = None if C is None else C.mT
         row_args, col_args = col_args, row_args
         tile_args = tuple(tile.mT for tile in tile_args)
@@ -217,6 +232,8 @@ def dispatch_gemm_act(
         quack_aux_out = quack_aux_out.view(torch.uint8)
     if quack_aux_out is not None and quack_aux_out.ndim == 2:
         quack_aux_out = quack_aux_out.unsqueeze(0)
+    if quack_local_reduce_out is not None and quack_local_reduce_out.ndim == 2:
+        quack_local_reduce_out = quack_local_reduce_out.unsqueeze(0)
     if quack_c is not None and quack_c.ndim == 2:
         quack_c = quack_c.unsqueeze(0)
 
@@ -242,7 +259,13 @@ def dispatch_gemm_act(
         is_dynamic_persistent=config.is_dynamic_persistent,
         tensor_epilogue_key=epilogue_key,
         tensor_epilogue_returns_aux=returns_aux,
+        tensor_epilogue_returns_local_reduce=quack_local_reduce_out is not None,
         tensor_epilogue_arg_kinds=epilogue_arg_kinds,
+        local_reduce_out=quack_local_reduce_out,
+        local_reduce_group=0 if local_reduce_group is None else local_reduce_group,
+        local_reduce_axis=1 if local_reduce_axis is None else local_reduce_axis,
+        local_reduce_combine_key=local_reduce_combine_key,
+        local_reduce_finalize_key=local_reduce_finalize_key,
         tensor_epilogue_rowvec_biases=row_args,
         tensor_epilogue_colvec_biases=col_args,
         tensor_epilogue_tile_biases=tile_args,
@@ -265,6 +288,13 @@ def gemm_epilogue(
     out_dtype: torch.dtype | None = None,
     out: torch.Tensor | None = None,
     aux_out: torch.Tensor | None = None,
+    local_reduce_out: torch.Tensor | None = None,
+    local_reduce_group: int | None = None,
+    local_reduce_axis: int | None = None,
+    local_reduce_combine_fn=None,
+    local_reduce_combine_key: str | None = None,
+    local_reduce_finalize_fn=None,
+    local_reduce_finalize_key: str | None = None,
     epilogue_args: tuple[torch.Tensor, ...] = (),
     epilogue_arg_kinds: tuple[str, ...] = (),
     config_key: GemmConfigKey | None = None,
@@ -334,6 +364,38 @@ def gemm_epilogue(
             raise RuntimeError(
                 f"aux_out shape must be {expected_shape}, got {tuple(aux_out.shape)}"
             )
+    if local_reduce_out is not None:
+        if a.ndim != 2:
+            raise NotImplementedError(
+                "FlexGEMM local-reduce aux outputs currently support only 2-D aten.mm"
+            )
+        if (
+            aux_out is not None
+            or effective_C is not None
+            or alpha != 1.0
+            or beta != 1.0
+        ):
+            raise NotImplementedError(
+                "FlexGEMM local-reduce aux outputs cannot be combined with aux_out/C/alpha/beta yet"
+            )
+        if local_reduce_group is None or local_reduce_group <= 0:
+            raise RuntimeError("local_reduce_group must be positive")
+        if local_reduce_axis not in (0, 1):
+            raise RuntimeError("local_reduce_axis must be 0 or 1")
+        if expected_shape[local_reduce_axis - 2] % local_reduce_group != 0:
+            raise RuntimeError(
+                "local_reduce_group must divide the selected FlexGEMM output dimension"
+            )
+        check_matrix("local_reduce_out", local_reduce_out)
+        check_matrix_major_layout("local_reduce_out", local_reduce_out)
+        expected_local_reduce_shape = list(expected_shape)
+        expected_local_reduce_shape[local_reduce_axis - 2] //= local_reduce_group
+        expected_local_reduce_shape = tuple(expected_local_reduce_shape)
+        if tuple(local_reduce_out.shape) != expected_local_reduce_shape:
+            raise RuntimeError(
+                f"local_reduce_out shape must be {expected_local_reduce_shape}, "
+                f"got {tuple(local_reduce_out.shape)}"
+            )
     if a.ndim == 3 and epilogue_args:
         raise NotImplementedError("FlexGEMM batched args are not supported yet")
     if epilogue_args and effective_C is not None:
@@ -344,7 +406,7 @@ def gemm_epilogue(
         raise NotImplementedError(
             "FlexGEMM args cannot be combined with non-default alpha/beta yet"
         )
-    tensors = (C, out, aux_out, *epilogue_args)
+    tensors = (C, out, aux_out, local_reduce_out, *epilogue_args)
     check_same_device(a, b, *(tensor for tensor in tensors if tensor is not None))
     inferred_arg_kinds = resolve_epilogue_arg_kinds(
         a, b, epilogue_args, epilogue_arg_kinds
@@ -355,9 +417,36 @@ def gemm_epilogue(
         epilogue_args, inferred_arg_kinds
     )
 
-    from torch._vendor.quack.gemm_act import register_tensor_epilogue_fn
+    from torch._vendor.quack.gemm_act import (
+        register_local_reduce_fns,
+        register_tensor_epilogue_fn,
+    )
 
     register_tensor_epilogue_fn(epilogue_key, epilogue_fn)
+    if local_reduce_out is not None and (
+        local_reduce_axis == 0
+        or (local_reduce_group is not None and local_reduce_group > 32)
+    ):
+        if local_reduce_combine_fn is None or local_reduce_finalize_fn is None:
+            raise RuntimeError(
+                "physical local reductions require generated local-reduce callbacks"
+            )
+        local_reduce_combine_key = (
+            local_reduce_combine_key
+            if local_reduce_combine_key is not None
+            else f"{epilogue_key}:local_reduce_combine"
+        )
+        local_reduce_finalize_key = (
+            local_reduce_finalize_key
+            if local_reduce_finalize_key is not None
+            else f"{epilogue_key}:local_reduce_finalize"
+        )
+        register_local_reduce_fns(
+            local_reduce_combine_key,
+            local_reduce_combine_fn,
+            local_reduce_finalize_key,
+            local_reduce_finalize_fn,
+        )
     out = (
         torch.empty(expected_shape, device=a.device, dtype=expected_dtype)
         if out is None
@@ -375,6 +464,11 @@ def gemm_epilogue(
             effective_C,
             out,
             aux_out,
+            local_reduce_out,
+            local_reduce_group,
+            local_reduce_axis,
+            local_reduce_combine_key,
+            local_reduce_finalize_key,
             epilogue_key,
             inferred_arg_kinds,
             row_args,
