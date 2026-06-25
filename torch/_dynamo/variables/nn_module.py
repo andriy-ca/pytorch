@@ -206,11 +206,6 @@ class NNModuleVariable(VariableTracker):
         self.source: Source = self.source
         self.nn_module_stack_source = self.source
 
-    def get_dict_vt(self, tx: "InstructionTranslatorBase") -> "DunderDictVariable":
-        if not hasattr(self, "dict_vt"):
-            self.dict_vt = variables.DunderDictVariable.create(tx, self)
-        return self.dict_vt
-
     def get_nn_module_stack_source(self) -> Source:
         res = self.nn_module_stack_source or self.source
         if not res:

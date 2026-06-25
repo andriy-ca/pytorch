@@ -1674,10 +1674,6 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         self.base_cls_vt = base_cls_vt
         self.init_args = init_args
 
-        # This records the attributes that were modified via instance
-        # `__dict__` directly, rather than the normal setattr path.
-        self.dict_vt: DunderDictVariable | None = None
-
         # Cache inspect.getattr_static outputs for the same name. This is fine
         # because if there is a mutation for the name, we use side-effects infra
         # to early return the mutated value.
@@ -1707,11 +1703,6 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.value_type.__name__})"
-
-    def get_dict_vt(self, tx: "InstructionTranslatorBase") -> "DunderDictVariable":
-        if self.dict_vt is None:
-            self.dict_vt = variables.DunderDictVariable.create(tx, self)
-        return self.dict_vt
 
     def is_base_vt_modified(self, side_effects: "SideEffects") -> bool:
         if self._base_vt is not None:
@@ -3020,7 +3011,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
             if isinstance(descriptor, types.GetSetDescriptorType):
                 if name_str == "__dict__":
-                    self.dict_vt = None
+                    self.invalidate_dict_vt()
                 # C get/set descriptors are applied by STORE_ATTR itself, so
                 # replay must stay descriptor-aware rather than using the
                 # descriptor-bypassing instance-dict or slot paths.
