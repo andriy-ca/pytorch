@@ -231,7 +231,6 @@ class NumBytesMetricTests(TestCase):
         inp = [T(10, 10, 10), T(10, 10, 10)]
         self.assertExpectedInline(count_numel(f, *inp), """2600""")
 
-    @torch._dynamo.config.patch(canonicalize_output_graph_node_order=False)
     @config.patch("fx_graph_cache", False)
     def test_cat_pointwise(self):
         def f(a, b):
@@ -804,8 +803,8 @@ class MinCutPartitioningTests(TestCase):
         inp = (T(100, grad=True),)
         self.assertExpectedInline(count_numel_train(f, *inp), """450""")
 
-    @torch._dynamo.config.patch(canonicalize_output_graph_node_order=False)
     @config.patch("fx_graph_cache", False)
+    @config.patch("autotune_local_cache", False)
     @patch.object(functorch.compile.config, "max_dist_from_bw", 1000)
     def test_partitioning_unremat_bw(self):
         def f(x):
