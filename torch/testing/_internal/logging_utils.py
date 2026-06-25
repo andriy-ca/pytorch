@@ -3,6 +3,7 @@
 import torch._dynamo.test_case
 import unittest.mock
 import os
+import sys
 import contextlib
 import torch._logging
 import torch._logging._internal
@@ -162,6 +163,28 @@ class LoggingTestCase(torch._dynamo.test_case.TestCase):
         def emit_post_hook(record):
             nonlocal record_list
             record_list.append(record)
+
+        # REPRO-DIAG: before the handler-count assertion can fire, dump every pt2
+        # logger carrying >2 handlers and identify each handler's source module so
+        # the CI log names the library leaking onto torch loggers. Remove before merging.
+        for diag_qname in torch._logging._internal.log_registry.get_log_qnames():
+            diag_logger = logging.getLogger(diag_qname)
+            if len(diag_logger.handlers) <= 2:
+                continue
+            print(
+                f"PT2_HANDLER_LEAK logger={diag_qname} count={len(diag_logger.handlers)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            for diag_handler in diag_logger.handlers:
+                diag_cls = type(diag_handler)
+                torch_owned = torch._logging._internal._is_torch_handler(diag_handler)
+                print(
+                    f"PT2_HANDLER_LEAK   handler={diag_cls.__module__}.{diag_cls.__qualname__} "
+                    f"torch_owned={torch_owned} repr={diag_handler!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         # registered logs are the only ones with handlers, so patch those
         for log_qname in torch._logging._internal.log_registry.get_log_qnames():
