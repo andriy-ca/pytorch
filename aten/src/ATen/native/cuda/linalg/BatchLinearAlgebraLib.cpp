@@ -723,7 +723,7 @@ static void apply_cholesky_cusolver_potrf_looped(const Tensor& self_working_copy
   scalar_t* self_working_copy_ptr = self_working_copy.data_ptr<scalar_t>();
   int* infos_ptr = infos.data_ptr<int>();
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
   size_t worksize_device;
   size_t worksize_host;
   cusolverDnParams_t params;
@@ -752,7 +752,7 @@ static void apply_cholesky_cusolver_potrf_looped(const Tensor& self_working_copy
   }
 
   TORCH_CUSOLVER_CHECK(cusolverDnDestroyParams(params));
-#else // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#else // defined(USE_CUSOLVER_64_BIT)
   int n_32 = cuda_int_cast(n, "n");
   int lda_32 = cuda_int_cast(lda, "lda");
   int lwork;
@@ -774,7 +774,7 @@ static void apply_cholesky_cusolver_potrf_looped(const Tensor& self_working_copy
       infos_ptr + i
     );
   }
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT)
 }
 
 // Implementation of Cholesky decomposition using batched cusolverDn<T>potrfBatched
@@ -832,7 +832,7 @@ static void apply_cholesky_cusolver_potrs(Tensor& self_working_copy, const Tenso
 
   int* infos_ptr = infos.data_ptr<int>();
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
   // Use xpotrs (64-bit) only when dimensions require 64-bit range.
   // hipSOLVER xpotrs produces incorrect results after 65535 sequential
   // calls in a loop for small dimensions (2^16 - 1 overflow in internal
@@ -855,7 +855,7 @@ static void apply_cholesky_cusolver_potrs(Tensor& self_working_copy, const Tenso
 
     TORCH_CUSOLVER_CHECK(cusolverDnDestroyParams(params));
   } else
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT)
   {
     int n_32 = cuda_int_cast(n, "n");
     int nrhs_32 = cuda_int_cast(nrhs, "nrhs");
@@ -960,7 +960,7 @@ static void apply_geqrf(const Tensor& A, const Tensor& tau) {
   auto infos_data = infos.data_ptr<int>();
 
   // get the optimal work size and allocate workspace tensor
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
   size_t worksize_device; // workspaceInBytesOnDevice
   size_t worksize_host; // workspaceInBytesOnHost
   cusolverDnParams_t params;
@@ -982,14 +982,14 @@ static void apply_geqrf(const Tensor& A, const Tensor& tau) {
   int lda_32 = cuda_int_cast(lda, "lda");
   at::cuda::solver::geqrf_bufferSize<scalar_t>(
       at::cuda::getCurrentCUDASolverDnHandle(), m_32, n_32, A_data, lda_32, &lwork);
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT)
 
   for (decltype(batch_size) i = 0; i < batch_size; i++) {
     scalar_t* A_working_ptr = &A_data[i * A_stride];
     scalar_t* tau_working_ptr = &tau_data[i * tau_stride];
     auto handle = at::cuda::getCurrentCUDASolverDnHandle();
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
     // allocate workspace storage on device and host
     auto& device_allocator = *at::cuda::getCUDADeviceAllocator();
     auto work_device_data = device_allocator.allocate(worksize_device);
@@ -1022,10 +1022,10 @@ static void apply_geqrf(const Tensor& A, const Tensor& tau) {
         static_cast<scalar_t*>(work_data.get()),
         lwork,
         infos_data);
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT)
   }
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
   TORCH_CUSOLVER_CHECK(cusolverDnDestroyParams(params));
 #endif
 
@@ -1323,7 +1323,7 @@ static void apply_syevd(const Tensor& values, const Tensor& vectors, const Tenso
   auto infos_data = infos.data_ptr<int>();
 
   // get the optimal work size and allocate workspace tensor
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
   size_t worksize_device; // workspaceInBytesOnDevice
   size_t worksize_host; // workspaceInBytesOnHost
   cusolverDnParams_t params;
@@ -1345,7 +1345,7 @@ static void apply_syevd(const Tensor& values, const Tensor& vectors, const Tenso
   int lda_32 = cuda_int_cast(lda, "lda");
   at::cuda::solver::syevd_bufferSize<scalar_t>(
       at::cuda::getCurrentCUDASolverDnHandle(), jobz, uplo, n_32, vectors_data, lda_32, values_data, &lwork);
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT)
 
   for (decltype(batch_size) i = 0; i < batch_size; i++) {
     scalar_t* vectors_working_ptr = &vectors_data[i * vectors_stride];
@@ -1353,7 +1353,7 @@ static void apply_syevd(const Tensor& values, const Tensor& vectors, const Tenso
     int* info_working_ptr = &infos_data[i];
     auto handle = at::cuda::getCurrentCUDASolverDnHandle();
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
     // allocate workspace storage on device and host
     auto& device_allocator = *at::cuda::getCUDADeviceAllocator();
     auto work_device_data = device_allocator.allocate(worksize_device);
@@ -1388,10 +1388,10 @@ static void apply_syevd(const Tensor& values, const Tensor& vectors, const Tenso
         static_cast<scalar_t*>(work_data.get()),
         lwork,
         info_working_ptr);
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT)
   }
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
   TORCH_CUSOLVER_CHECK(cusolverDnDestroyParams(params));
 #endif
 }
@@ -1411,7 +1411,7 @@ static void apply_syevj_batched(const Tensor& values, const Tensor& vectors, con
   auto values_data = values.data_ptr<value_t>();
   auto infos_data = infos.data_ptr<int>();
 
-#if !defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED) && !defined(USE_ROCM)
+#if !defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED)
   // syevj_params controls the numerical accuracy of syevj
   // by default the tolerance is set to machine accuracy
   // the maximum number of iteration of Jacobi method by default is 100
@@ -1502,7 +1502,7 @@ static void apply_syevj_batched(const Tensor& values, const Tensor& vectors, con
       batch_size);
   TORCH_CUSOLVER_CHECK(cusolverDnDestroyParams(syev_params));
 
-#endif // defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED)
 }
 
 static void linalg_eigh_cusolver_syevd(const Tensor& eigenvalues, const Tensor& eigenvectors, const Tensor& infos, bool upper, bool compute_eigenvectors) {

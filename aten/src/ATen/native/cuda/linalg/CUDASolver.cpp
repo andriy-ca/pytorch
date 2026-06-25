@@ -1048,7 +1048,7 @@ template<> cudaDataType get_cusolver_datatype<c10::complex<float>>() { return CU
 template<> cudaDataType get_cusolver_datatype<c10::complex<double>>() { return CUDA_C_64F; }
 #endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
 
 void xpotrf_buffersize(
     cusolverDnHandle_t handle, cusolverDnParams_t params, cublasFillMode_t uplo, int64_t n, cudaDataType dataTypeA, const void *A,
@@ -1066,7 +1066,7 @@ void xpotrf(
     handle, params, uplo, n, dataTypeA, A, lda, computeType, bufferOnDevice, workspaceInBytesOnDevice, bufferOnHost, workspaceInBytesOnHost, info
   ));
 }
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT)
 
 template <>
 void syevd_bufferSize<float>(
@@ -1396,7 +1396,7 @@ void syevjBatched<c10::complex<double>, double>(
       batchsize));
 }
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT)
 
 void xpotrs(
     cusolverDnHandle_t handle, cusolverDnParams_t params, cublasFillMode_t uplo, int64_t n, int64_t nrhs, cudaDataType dataTypeA, const void *A,
@@ -1802,7 +1802,7 @@ void xsyevd<c10::complex<double>, double>(
       info));
 }
 
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT)
 
 // cuSOLVER Xgeev bindings (requires cuSOLVER >= 11.7.2, i.e. CUDA 12.8+)
 #if (defined(CUSOLVER_VERSION) && (CUSOLVER_VERSION >= 11702)) || (defined(USE_ROCM) && ROCM_VERSION >= 71400)
@@ -2126,7 +2126,7 @@ void xgeev<c10::complex<double>>(
 
 #endif // (defined(CUSOLVER_VERSION) && (CUSOLVER_VERSION >= 11702)) || (defined(USE_ROCM) && ROCM_VERSION >= 71400)
 
-#if defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED) || defined(USE_ROCM)
+#if defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED)
 
 template <>
 void xsyevBatched_bufferSize<float>(
@@ -2392,6 +2392,6 @@ void xsyevBatched<c10::complex<double>, double>(
        batchSize));
 }
 
-#endif // defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED) || defined(USE_ROCM)
+#endif // defined(USE_CUSOLVER_64_BIT_XSYEV_BATCHED)
 
 } // namespace at::cuda::solver
