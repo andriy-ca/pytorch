@@ -747,12 +747,6 @@ class UserFunctionVariable(BaseUserFunctionVariable):
         source = self.get_source()
         return fn_getattro_impl(tx, self.fn, source, name)
 
-    def call_obj_hasattr(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> ConstantVariable:
-        result = hasattr(self.fn, name)
-        return VariableTracker.build(tx, result)
-
     def tp_descr_get_impl(
         self,
         tx: "InstructionTranslatorBase",
@@ -2520,11 +2514,6 @@ class SkipFunctionVariable(VariableTracker):
         raise NotImplementedError(
             "Python codegen not implemented for sourceless SkipFunctionVariable"
         )
-
-    def call_obj_hasattr(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> ConstantVariable:
-        return VariableTracker.build(tx, hasattr(self.value, name))
 
     def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str

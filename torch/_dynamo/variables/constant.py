@@ -12,7 +12,6 @@ import enum
 import operator
 from collections.abc import Iterable
 from typing import Any, Literal, overload, TYPE_CHECKING
-from typing_extensions import override
 
 import torch
 from torch._dynamo.source import GetItemSource
@@ -451,12 +450,15 @@ class ConstantVariable(VariableTracker):
     def reconstruct_pycode(self, codegen) -> str:
         return repr(self.value)
 
-    @override
-    def call_obj_hasattr(
-        self, tx: InstructionTranslatorBase, name: str
-    ) -> ConstantVariable:
-        result = hasattr(self.value, name)
-        return variables.ConstantVariable.create(result)
+    def is_python_equal(self, other: object) -> bool:
+        from .tensor import SymNodeVariable
+
+        if isinstance(other, SymNodeVariable):
+            return self.as_python_constant() == other.evaluate_expr()
+        return (
+            isinstance(other, VariableTracker)
+            and self.as_python_constant() == other.as_python_constant()
+        )
 
     def get_id(self, tx: InstructionTranslatorBase) -> int | None:
         # Singletons have guaranteed stable identity across the process lifetime.
