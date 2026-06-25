@@ -926,11 +926,13 @@ class CatLinearFusion(BatchFusion):
                         # slice is a differentiable view of the full weight; the
                         # clone makes each GEMM operand contiguous. Folds to a const
                         # when frozen; in training it's a cheap weight-only op.
+                        # pyrefly: ignore [not-callable]
                         with graph.inserting_after(anchor):
                             w_slice = graph.call_function(  # type: ignore[operator]
                                 aten.slice.Tensor,
                                 args=(weight, 1, offsets[i], offsets[i + 1]),
                             )
+                        # pyrefly: ignore [not-callable]
                         with graph.inserting_after(w_slice):
                             w_cont = graph.call_function(  # type: ignore[operator]
                                 aten.clone.default,
