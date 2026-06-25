@@ -432,7 +432,7 @@ template <>
 void ormqr<c10::complex<double>>(
     CUDASOLVER_ORMQR_ARGTYPES(c10::complex<double>));
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#ifdef USE_CUSOLVER_64_BIT
 template<class Dtype>
 cudaDataType get_cusolver_datatype() {
   static_assert(false&&sizeof(Dtype), "cusolver doesn't support data type");
@@ -442,7 +442,7 @@ template<> cudaDataType get_cusolver_datatype<float>();
 template<> cudaDataType get_cusolver_datatype<double>();
 template<> cudaDataType get_cusolver_datatype<c10::complex<float>>();
 template<> cudaDataType get_cusolver_datatype<c10::complex<double>>();
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // USE_CUSOLVER_64_BIT
 
 #ifdef USE_CUSOLVER_64_BIT
 

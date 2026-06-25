@@ -1041,12 +1041,12 @@ void ormqr<c10::complex<double>>(CUDASOLVER_ORMQR_ARGTYPES(c10::complex<double>)
       devInfo));
 }
 
-#if defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#ifdef USE_CUSOLVER_64_BIT
 template<> cudaDataType get_cusolver_datatype<float>() { return CUDA_R_32F; }
 template<> cudaDataType get_cusolver_datatype<double>() { return CUDA_R_64F; }
 template<> cudaDataType get_cusolver_datatype<c10::complex<float>>() { return CUDA_C_32F; }
 template<> cudaDataType get_cusolver_datatype<c10::complex<double>>() { return CUDA_C_64F; }
-#endif // defined(USE_CUSOLVER_64_BIT) || defined(USE_ROCM)
+#endif // USE_CUSOLVER_64_BIT
 
 #ifdef USE_CUSOLVER_64_BIT
 
