@@ -3500,20 +3500,20 @@ class GuardManager {
     return this->check_accessors_nopybind(value);
   }
 
-  bool check_dict_pointer_tags(PyObject* value) {
-    if (_dict_callback_installed) {
-      // This means that for 3.12+, there are callbacks watching dict pointers.
-      return true;
-    }
-    for (auto& kv : _dict_pointers[value]) {
-      PyObject* dict_pointer = kv.first;
-      uint64_t old_tag = kv.second;
-      uint64_t new_tag = get_dict_version_unchecked(dict_pointer);
-      if (old_tag != new_tag) {
-        return false;
-      }
-    }
-    return true;
+  bool dict_watchers_installed() {
+    // Only fast-path recursive dict-tag matching when dict watchers are
+    // installed (3.12+ with a successful PyDict_Watch). The watcher callback
+    // sets _disable_dict_tag_matching on ANY change to a recorded dict, and the
+    // caller only invokes this when !_disable_dict_tag_matching, so reaching
+    // here means no recorded dict changed -- no per-dict version check (and no
+    // dict dereference) is needed.
+    //
+    // Without watchers we would have to read versions off the RAW recorded dict
+    // pointers in _dict_pointers. Those interior dicts can be freed while the
+    // tag-safe-root `value` is still alive (the value weakref callback only
+    // protects `value` itself, not nested dicts), so dereferencing them is a
+    // use-after-free. In that case bail and let the full guard check run.
+    return _dict_callback_installed;
   }
 
   bool check_tensor_metadata_fast(PyObject* value) {
@@ -3623,9 +3623,7 @@ class GuardManager {
         // Check if the `value` object was recorded earlier
         if (_dict_pointers.find(value) != _dict_pointers.end()) {
           // Check for fast path
-          // if (is_weakref_valid(value) && check_dict_pointer_tags(value)) {
-          if (check_dict_pointer_tags(value) &&
-              check_tensor_metadata_fast(value)) {
+          if (dict_watchers_installed() && check_tensor_metadata_fast(value)) {
             if (check_no_tensor_aliasing_guards_fast(value)) {
               return true;
             } else {
