@@ -256,11 +256,11 @@ from .misc import (
     AutogradEngineVariable,
     AutogradFunctionContextVariable,
     AutogradFunctionVariable,
+    BoundMethodVariable,
     ComptimeVariable,
     ConstantLikeVariable,
     DebuggingVariable,
     DelayGraphBreakVariable,
-    GetAttrVariable,
     IgnoredFunctionVariable,
     LambdaVariable,
     LoggingLoggerVariable,
@@ -1457,13 +1457,12 @@ class VariableBuilder:
                     GuardBuilder.CLOSURE_MATCH
                 )
             )
-            return GetAttrVariable(
+            return BoundMethodVariable(
                 AutogradFunctionVariable(
                     value.__self__,
                     source=AttrSource(self.source, member="__self__"),
                 ),
                 "apply",
-                py_type=type(value),
             )
         elif (
             isinstance(value, types.MethodType)
@@ -1480,7 +1479,7 @@ class VariableBuilder:
             random_self = value.__self__
             obj_source = self.source and AttrSource(self.source, "__self__")
             obj_vt = VariableTracker.build(self.tx, random_self, obj_source)
-            return GetAttrVariable(obj_vt, value.__name__, py_type=type(value))
+            return BoundMethodVariable(obj_vt, value.__name__)
         elif isinstance(value, torch._C._ImperativeEngine):
             self.install_guards(GuardBuilder.ID_MATCH)
             return AutogradEngineVariable(value, source=self.source)
@@ -1797,10 +1796,9 @@ class VariableBuilder:
             return BoundBuiltinMethodVariable(descriptor, obj_vt, source=self.source)
         elif is_function(value) and value in (float.fromhex, float.hex):
             self.install_guards(GuardBuilder.ID_MATCH)
-            return GetAttrVariable(
+            return BoundMethodVariable(
                 BuiltinVariable(float, source=self.source),
                 value.__name__,
-                py_type=type(value),
             )
         elif is_function_or_wrapper(value):
             value, attr_name = unwrap_with_attr_name_if_wrapper(value)
@@ -4970,7 +4968,7 @@ class SourcelessBuilder:
             # NamedTuple._make uses an alias of tuple.__new__
             # pyrefly: ignore[not-callable, bad-argument-count, missing-attribute]
             obj = trace_rules.lookup_callable(value.__self__)(value.__self__)
-            return GetAttrVariable(obj, "__new__", py_type=type(value))
+            return BoundMethodVariable(obj, "__new__")
         elif is_function_or_wrapper(value):
             # pyrefly: ignore[not-callable, bad-argument-count]
             return trace_rules.lookup(value)(value)
