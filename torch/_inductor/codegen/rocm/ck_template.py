@@ -22,9 +22,9 @@ class CKTemplate(ROCmTemplate):
         torch.int32: "I32",
         torch.int8: "I8",
         torch.float8_e4m3fnuz: "F8",  # gfx94
-        torch.float8_e4m3fn: "F8",  # gfx95
+        torch.float8_e4m3fn: "F8",  # gfx95, gfx1250
         torch.float8_e5m2fnuz: "BF8",  # gfx94
-        torch.float8_e5m2: "BF8",  # gfx95
+        torch.float8_e5m2: "BF8",  # gfx95, gfx1250
     }
 
     @staticmethod

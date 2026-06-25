@@ -324,7 +324,11 @@ class TestCKBackend(TestCase):
     ):
         use_fast_accum = False
         runtime_arch = torch.cuda.get_device_properties(0).gcnArchName
-        if "gfx94" not in runtime_arch and "gfx95" not in runtime_arch:
+        if (
+            "gfx94" not in runtime_arch
+            and "gfx95" not in runtime_arch
+            and "gfx1250" not in runtime_arch
+        ):
             self.skipTest(f"Unsupported arch {runtime_arch}")
         # output dtype
         dtype = torch.bfloat16
