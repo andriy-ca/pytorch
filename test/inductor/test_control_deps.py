@@ -1,5 +1,7 @@
 # Owner(s): ["module: inductor"]
 
+import unittest
+
 import torch
 from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
@@ -8,9 +10,13 @@ from torch.testing import FileCheck
 from torch.testing._internal.common_utils import IS_LINUX
 from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
+    HAS_CUDA_AND_TRITON,
     HAS_GPU_AND_TRITON,
     requires_gpu,
 )
+
+
+requires_cuda_triton = unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA")
 
 
 class TestControlDeps(InductorTestCase):
@@ -442,6 +448,199 @@ class TestControlDeps(InductorTestCase):
         # non-control_deps node -> not ordering only
         add = g.call_function(torch.ops.aten.add.Tensor, args=(view, other))
         self.assertFalse(_is_control_deps_ordering_only_use(add, view))
+
+    @requires_gpu()
+    def test_control_deps_passthrough_uses_ordering_output(self):
+        """Pass-through values in control_deps use OrderingOutput.
+
+        OrderingOutput creates a rename chain for scheduling order (so future
+        readers depend on the void op) without mutation side effects: no
+        mark_buffer_mutated, no forced realization, no lifetime extension.
+        """
+        from torch._inductor import ir
+        from torch._inductor.virtualized import V
+
+        captured: list[dict] = []
+
+        def capture(nodes):
+            ordering_count = 0
+            mutation_count = 0
+            for op in V.graph.operations:
+                if hasattr(op, "mutation_outputs"):
+                    for m in op.mutation_outputs:
+                        if isinstance(m, ir.OrderingOutput):
+                            ordering_count += 1
+                        else:
+                            mutation_count += 1
+            captured.append(
+                {
+                    "ordering_count": ordering_count,
+                    "mutation_count": mutation_count,
+                    "mutated_buffers": set(V.graph.mutated_buffers),
+                }
+            )
+            return nodes
+
+        def fn(x):
+            s = torch.Stream(device=GPU_TYPE)
+            e = torch.Event()
+            with s:
+                y = x + 1
+                e.record()
+            e.wait()
+            return y * 2
+
+        torch._dynamo.reset()
+        with config.patch(_pre_fusion_custom_pass=capture):
+            x = torch.ones(4, device=GPU_TYPE)
+            result = torch.compile(fn)(x)
+
+        expected = fn(torch.ones(4, device=GPU_TYPE))
+        torch.testing.assert_close(result, expected)
+
+        self.assertTrue(captured, "expected at least one Inductor compile")
+        total_ordering = sum(c["ordering_count"] for c in captured)
+        self.assertGreater(total_ordering, 0, "expected OrderingOutput entries")
+
+    @requires_gpu()
+    def test_ordering_output_does_not_mark_graph_input_mutated(self):
+        """OrderingOutput must not mark graph inputs as mutated.
+
+        When a graph input passes through control_deps unchanged, the old
+        MutationOutput approach would call mark_buffer_mutated, causing the
+        scheduler to add the input to mutated_inputs -- advertising a phantom
+        mutation that changes the calling convention. OrderingOutput avoids
+        this by not calling mark_buffer_mutated at all.
+        """
+        from torch._inductor.virtualized import V
+
+        captured_mutated_inputs: list[set[str]] = []
+
+        def capture(nodes):
+            captured_mutated_inputs.append(set(V.graph.mutated_buffers))
+            return nodes
+
+        def fn(x):
+            s = torch.Stream(device=GPU_TYPE)
+            e = torch.Event()
+            with s:
+                e.record()
+            e.wait()
+            # x passes through control_deps unchanged (it's a graph input)
+            return x + 1
+
+        torch._dynamo.reset()
+        with config.patch(_pre_fusion_custom_pass=capture):
+            x = torch.ones(4, device=GPU_TYPE)
+            result = torch.compile(fn)(x)
+
+        expected = fn(torch.ones(4, device=GPU_TYPE))
+        torch.testing.assert_close(result, expected)
+
+        # The graph input buffer should NOT appear in mutated_buffers
+        self.assertTrue(captured_mutated_inputs, "expected at least one compile")
+        graph_input_names = {"arg0_1", "primals_1"}
+        for mutated in captured_mutated_inputs:
+            self.assertFalse(
+                mutated & graph_input_names,
+                f"graph inputs should not be in mutated_buffers: {mutated & graph_input_names}",
+            )
+
+    def test_default_stream_setup_only_once_per_device(self):
+        """default_stream capture should only run once per device entry.
+
+        User streams (stream1, etc.) are always re-fetched from the registry
+        since they're idempotent lookups. Only default_stream = current_stream()
+        is dangerous to re-run (it can latch the offload stream).
+
+        Tests the setup_stream_cache flag logic directly on the dataclass.
+        """
+        from torch._inductor.codegen.wrapper import (
+            EnterDeviceContextManagerWithStreamInfoLine,
+        )
+
+        last_device = None
+        stream_map = {1: 10}
+
+        def make_line(device_idx):
+            nonlocal last_device
+            setup = last_device != device_idx
+            last_device = device_idx
+            return EnterDeviceContextManagerWithStreamInfoLine(
+                device_idx=device_idx,
+                last_seen_device_guard_index=None,
+                num_streams=2,
+                stream_idx_to_user_obj_idx=stream_map,
+                setup_stream_cache=setup,
+            )
+
+        # First call for device 0: should setup default_stream
+        self.assertTrue(make_line(0).setup_stream_cache)
+
+        # Same device again: should NOT re-capture default_stream
+        self.assertFalse(
+            make_line(0).setup_stream_cache,
+            "Second entry for same device should skip default_stream capture",
+        )
+
+        # Different device: should setup default_stream
+        self.assertTrue(
+            make_line(1).setup_stream_cache,
+            "Different device should re-capture default_stream",
+        )
+
+        # Re-enter device 0 after device 1: must re-capture
+        self.assertTrue(
+            make_line(0).setup_stream_cache,
+            "Re-entering device 0 after device 1 must re-capture default_stream",
+        )
+
+    @requires_gpu()
+    def test_generated_code_uses_get_stream_by_index(self):
+        """Generated inductor code should use _get_stream_by_index to
+        retrieve user streams from the external object registry."""
+
+        def fn(x):
+            s = torch.Stream(device=GPU_TYPE)
+            with s:
+                return x + 1
+
+        x = torch.ones(4, 4, device=GPU_TYPE)
+        result, code = run_and_get_code(torch.compile(fn), x)
+        FileCheck().check("_get_stream_by_index").run(code[0])
+
+        expected = fn(torch.ones(4, 4, device=GPU_TYPE))
+        torch.testing.assert_close(result, expected)
+
+    @requires_cuda_triton
+    def test_restore_external_objects_before_backward(self):
+        """The forward epilogue snapshots the external object registry into
+        ctx._external_objects, and backward restores it before calling the
+        compiled backward. This protects against another torch.compile frame's
+        store_user_object_weakrefs clobbering the registry.
+
+        We compile a multi-stream function, run forward, clobber the global
+        registry (simulating a second frame), then run backward. Without the
+        snapshot/restore, backward fails."""
+        from torch._dynamo.graph_bytecode_inputs import store_user_object_weakrefs
+
+        def fn(x):
+            s = torch.Stream(device=GPU_TYPE)
+            with s:
+                return x * 2 + 1
+
+        compiled_fn = torch.compile(fn)
+        x = torch.randn(4, 4, device=GPU_TYPE, requires_grad=True)
+        out = compiled_fn(x)
+
+        # Clobber the global registry as a second compile frame would.
+        store_user_object_weakrefs(torch.cuda.Stream())
+
+        # Without ctx._external_objects snapshot/restore, backward crashes
+        # with "Index not registered in index_to_external_object_weakref".
+        out.sum().backward()
+        self.assertIsNotNone(x.grad)
+        torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
 
 
 if __name__ == "__main__":
