@@ -52,6 +52,10 @@ class TestCKBackend(TestCase):
 
         self.ck_dir, _, _, _ = try_import_ck_lib()
         if not self.ck_dir:
+            # Fall back to an explicit CK source tree
+            # (e.g. pointing at a checkout that ships the ck_tile headers).
+            self.ck_dir = os.environ.get("TORCHINDUCTOR_CK_DIR")
+        if not self.ck_dir:
             raise unittest.SkipTest("Composable Kernel library is not installed")
 
         try:
@@ -495,6 +499,133 @@ class TestCKBackend(TestCase):
 
             Y_eager = bmm(a=a, b=b)
             torch.testing.assert_close(Y_compiled, Y_eager)
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(os.environ, _test_env)
+    @parametrize("arch", ("gfx942", "gfx950"))
+    def test_ck_tile_gemm_compiles(self, arch):
+        """
+        Compile-only regression test for the CK-Tile universal GEMM backend.
+
+        Renders the HIP source for a representative CK-Tile GEMM instance from each
+        (pipeline, epilogue) stratum and cross-compiles each with hipcc (object
+        only, no device execution), asserting that *every* stratum compiles for the
+        target arch.
+
+        This catches the silent-breakage class where a CK API change makes CK-Tile
+        instances fail to compile -- in which case the autotuner prunes them and
+        falls back to ATen/Triton ("CKTILE ignored") instead of erroring. Covering
+        each (pipeline, epilogue) ensures a break confined to a single variant --
+        e.g. only the CShuffle epilogue -- is still caught.
+        """
+        import subprocess
+        import tempfile
+        from collections import defaultdict
+
+        from torch._inductor.codegen.rocm.ck_tile_universal_gemm_template import (
+            CKTileGemmTemplate,
+            ops as ck_tile_ops,
+        )
+        from torch._inductor.codegen.rocm.compile_command import rocm_compile_command
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.ir import Buffer, FixedLayout
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        # Prefer an explicit CK source tree (local dev) over the installed wheel.
+        ck_dir = os.environ.get("TORCHINDUCTOR_CK_DIR") or self.ck_dir
+
+        dtype = torch.bfloat16
+        M, N, K = 2240, 2048, 256
+        device = torch.device("cuda")
+        compile_timeout_s = 600
+
+        gm = make_fx(lambda: torch.zeros(1))()
+        graph = GraphLowering(gm)
+
+        # Render one representative instance per (pipeline, epilogue) stratum within
+        # a minimal graph context.
+        sources = []
+        with (
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "rocm.arch": [arch],
+                    "rocm.ck_dir": ck_dir,
+                }
+            ),
+            V.set_graph_handler(graph),
+        ):
+            x = Buffer(name="X", layout=FixedLayout(device, dtype, [M, K], [K, 1]))
+            w = Buffer(name="W", layout=FixedLayout(device, dtype, [K, N], [N, 1]))
+            out_layout = FixedLayout(device, dtype, [M, N], [N, 1])
+
+            template = CKTileGemmTemplate([x, w], out_layout)
+
+            by_stratum = defaultdict(list)
+            for op in ck_tile_ops():
+                if template.filter_op(op) is not None:
+                    by_stratum[(op.pipeline, op.epilogue)].append(op)
+            self.assertGreater(
+                len(by_stratum), 0, f"No CK-Tile instances were generated for {arch}"
+            )
+
+            # The synthetic GraphLowering doesn't know our input buffers, so teach
+            # V.graph.get_dtype about them. generate() wraps this with its own fake
+            # for the output node, delegating unknown names back to this function.
+            dtype_lookup = {"X": dtype, "W": dtype, template.output_node.get_name(): dtype}
+
+            with unittest.mock.patch.object(
+                V.graph, "get_dtype", lambda name: dtype_lookup[name]
+            ):
+                for stratum, op_list in sorted(by_stratum.items()):
+                    op = op_list[0]
+                    k_batch = template.k_batch_choices(op)[0]
+                    caller = template.generate(op=op, kBatch=k_batch)
+                    sources.append((stratum, op.name(), caller.bmreq.source_code))
+
+        def compile_object(source):
+            with tempfile.NamedTemporaryFile("w", suffix=".cu", delete=False) as f:
+                f.write(source)
+                src_path = f.name
+            obj_path = src_path + ".o"
+            command = rocm_compile_command([src_path], obj_path, "o")
+            try:
+                proc = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=compile_timeout_s,
+                )
+                rc, out = proc.returncode, proc.stderr or proc.stdout
+            except subprocess.TimeoutExpired:
+                rc, out = 1, f"timed out after {compile_timeout_s}s"
+            finally:
+                for p in (src_path, obj_path):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            return rc, command, out
+
+        failures = []
+        with config.patch({"rocm.arch": [arch], "rocm.ck_dir": ck_dir}):
+            for stratum, name, source in sources:
+                rc, command, out = compile_object(source)
+                if rc != 0:
+                    failures.append((stratum, name, command, out))
+
+        if failures:
+            stratum, name, command, out = failures[0]
+            self.fail(
+                f"{len(failures)}/{len(sources)} CK-Tile (pipeline, epilogue) strata "
+                f"failed to compile for {arch} "
+                f"(failed strata: {[f[0] for f in failures]}); the CK-Tile backend "
+                f"is silently disabled for those.\nFirst failing instance: {name}\n"
+                f"Reproduce: {command}\n--- compiler output (truncated) ---\n"
+                f"{out[-4000:]}"
+            )
 
 
 if __name__ == "__main__":

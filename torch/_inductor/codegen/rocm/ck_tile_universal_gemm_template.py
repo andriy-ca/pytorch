@@ -237,11 +237,7 @@ class CKTileGemmTemplate(CKTileTemplate):
     extern "C" {
     PT_EXPORT {{kernel_definition}} {
 
-        using {{instance_namespace}}::BaseGemmPipeline;
-        using {{instance_namespace}}::TilePartitioner;
-
-        constexpr auto TileK = {{instance_namespace}}::TileK;
-        constexpr auto kPrefetchStages = BaseGemmPipeline::PrefetchStages;
+        using {{instance_namespace}}::Kernel;
 
         const auto BiasTerms = std::array<const void*, 0> ();
         const auto BiasStrides = std::array<int32_t, 0> ();
@@ -266,33 +262,20 @@ class CKTileGemmTemplate(CKTileTemplate):
             return 0;
         }
 
-        const ck_tile::index_t k_grain     = kBatch * TileK;
-        const ck_tile::index_t K_split     = (K + k_grain - 1) / k_grain * TileK;
-        const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);
-        const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
-        const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
+        // The hot-loop / tail-number dispatch lives inside the kernel,
+        // so we launch the kernel directly instead of dispatching via TailHandler.
+        if (!Kernel::IsSupportedArgument(kargs)) {
+            // we do our best to statically avoid this case in `filter_op`
+            throw std::runtime_error("invalid argument");
+        }
 
-        // run the kernel
-        const auto Run = [&](const auto has_hot_loop_, const auto tail_number_) {
-            constexpr bool has_hot_loop_v = has_hot_loop_.value;
-            constexpr auto tail_number_v = tail_number_.value;
-
-            using Kernel = {{instance_namespace}}::Kernel<has_hot_loop_v, tail_number_v>;
-
-            if (!Kernel::IsSupportedArgument(kargs)) {
-                // we do our best to statically avoid this case in `filter_op`
-                throw std::runtime_error("invalid argument");
-            }
-            auto stream_config = ck_tile::stream_config{stream};
-            auto grid_size = Kernel::GridSize(M, N, kBatch);
-            auto block_size = Kernel::BlockSize();
-            constexpr auto lds_bytes = 0;
-            constexpr auto kBlockPerCU = 1;
-            auto gemm = ck_tile::make_kernel<kBlockPerCU>(Kernel{}, grid_size, block_size, lds_bytes, kargs);
-            ck_tile::launch_kernel(stream_config, gemm);
-        };
-
-        BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
+        auto stream_config = ck_tile::stream_config{stream};
+        auto grid_size = Kernel::GridSize(M, N, kBatch);
+        auto block_size = Kernel::BlockSize();
+        constexpr auto lds_bytes = 0;
+        constexpr auto kBlockPerCU = 1;
+        auto gemm = ck_tile::make_kernel<kBlockPerCU>(Kernel{}, grid_size, block_size, lds_bytes, kargs);
+        ck_tile::launch_kernel(stream_config, gemm);
 
         return 0;
     } // kernel definition
@@ -593,7 +576,6 @@ class CKTileGemmTemplate(CKTileTemplate):
 
         {{rendered_scheduler}}
 
-        template<bool has_hot_loop_v, ck_tile::TailNumber tail_number_v>
         using UniversalGemmProblem =
             ck_tile::UniversalGemmPipelineProblem<ADataType,
                                                   BDataType,
@@ -601,15 +583,16 @@ class CKTileGemmTemplate(CKTileTemplate):
                                                   GemmShape,
                                                   GemmUniversalTraits,
                                                   scheduler,
-                                                  has_hot_loop_v,
-                                                  tail_number_v>;
+                                                  ck_tile::element_wise::PassThrough,
+                                                  ck_tile::element_wise::PassThrough,
+                                                  ADataType,
+                                                  BDataType>;
 
         {{rendered_pipeline}}
 
         {{rendered_epilogue}}
 
-        template<bool has_hot_loop_v, ck_tile::TailNumber tail_number_v>
-        using Kernel = ck_tile::GemmKernel<TilePartitioner, GemmPipeline<has_hot_loop_v, tail_number_v>, GemmEpilogue>;
+        using Kernel = ck_tile::GemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue>;
     }
 
 """
@@ -643,7 +626,7 @@ class CKTileGemmTemplate(CKTileTemplate):
                 return r"""
             using DsDataType = ck_tile::tuple<>; // no bias terms for vanilla GEMM
             using DsLayout = ck_tile::tuple<>;
-            constexpr auto ELayout = CLayout;
+            using ELayout = CLayout;
             using CDEElementWise = ck_tile::element_wise::PassThrough; // no-op
             using EpilogueProblem = ck_tile::CShuffleEpilogueProblem<ADataType,
                                                                      BDataType,
@@ -671,8 +654,7 @@ class CKTileGemmTemplate(CKTileTemplate):
             return rf"""
             using BaseGemmPipeline = ck_tile::BaseGemmPipelineAgBgCr{pipeline_type}<GemmPipelineProblem>;
 
-            template<bool has_hot_loop_v, ck_tile::TailNumber tail_number_v>
-            using GemmPipeline = ck_tile::GemmPipelineAgBgCr{pipeline_type}<UniversalGemmProblem<has_hot_loop_v, tail_number_v>>;
+            using GemmPipeline = ck_tile::GemmPipelineAgBgCr{pipeline_type}<UniversalGemmProblem>;
         """
 
         def render_scheduler(scheduler_type):
