@@ -2759,28 +2759,84 @@ def use_ck_template(layout: Layout) -> bool:
     return True
 
 
+@functools.lru_cache(None)
+def _warn_missing_ck_header(header: str) -> None:
+    """Emit a one-time, actionable warning if a CK header the generated kernels
+    #include does not resolve against the runtime include roots. Diagnostic only:
+    it never changes gating (the caller still returns its normal verdict), so a
+    missing header degrades exactly as before (invalid choice scores +inf) but is
+    now explained instead of surfacing as a bare hipcc error.
+
+    Cached per header so it fires once per process, not per lowering.
+    """
+    try:
+        from ck4inductor import check_headers  # type: ignore[import]
+
+        result = check_headers(headers=(header,), try_compile=False)
+        entry = result["headers"][header]
+        resolved = entry["resolved"]
+        roots = result["include_roots"]
+    except Exception:
+        # Older ck4inductor without check_headers(), or import failure: fall back
+        # to a minimal inline path search over the same roots the runtime uses.
+        ck_dir = config.rocm.ck_dir or ""
+        rocm_home = (
+            os.environ.get("ROCM_HOME")
+            or os.environ.get("ROCM_PATH")
+            or "/opt/rocm"
+        )
+        roots = [
+            os.path.join(ck_dir, "include"),
+            os.path.join(ck_dir, "library", "include"),
+            os.path.join(rocm_home, "include"),
+        ]
+        resolved = any(os.path.exists(os.path.join(r, header)) for r in roots)
+
+    if not resolved:
+        log.warning(
+            "Composable Kernel is enabled but the header %r does not resolve "
+            "in any include root %s. Affected CK choices will fail to compile "
+            "and be skipped. Check that $ROCM_HOME points at a complete CK "
+            "install, or install a matching ck4inductor wheel.",
+            header,
+            roots,
+        )
+
+
 def use_ck_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
     from .virtualized import V
 
-    return (
+    enabled = (
         _use_autotune_backend("CK")
         and use_ck_template(layout)
         and V.graph.sizevars.optimization_hint(m * n * k, fallback=-1) > 0
     )
+    if enabled:
+        # Classic CK: ck/ck.hpp pulls ck/config.h transitively.
+        _warn_missing_ck_header("ck/ck.hpp")
+        _warn_missing_ck_header("ck/config.h")
+    return enabled
 
 
 def use_ck_tile_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
     from .virtualized import V
 
-    return (
+    enabled = (
         _use_autotune_backend("CKTILE")
         and use_ck_template(layout)
         and V.graph.sizevars.optimization_hint(m * n * k, fallback=-1) > 0
     )
+    if enabled:
+        _warn_missing_ck_header("ck_tile/core.hpp")
+    return enabled
 
 
 def use_ck_conv_template(layout: Layout) -> bool:
-    return _use_conv_autotune_backend("CK") and use_ck_template(layout)
+    enabled = _use_conv_autotune_backend("CK") and use_ck_template(layout)
+    if enabled:
+        _warn_missing_ck_header("ck/ck.hpp")
+        _warn_missing_ck_header("ck/config.h")
+    return enabled
 
 
 def _use_template_for_cpu(layout: Layout) -> bool:
