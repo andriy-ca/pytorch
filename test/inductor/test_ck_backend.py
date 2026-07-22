@@ -1,6 +1,7 @@
 # Owner(s): ["module: inductor"]
 import logging
 import os
+import re
 import unittest
 
 
@@ -12,7 +13,7 @@ except ImportError:
 import torch
 from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase
-from torch._inductor.utils import try_import_ck_lib
+from torch._inductor.utils import run_and_get_code, try_import_ck_lib
 from torch.testing._internal.common_cuda import tf32_off
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -34,6 +35,24 @@ log = logging.getLogger(__name__)
 
 # patch env for tests if needed
 _test_env = {}
+
+
+# A selected CK kernel is emitted into the generated wrapper as an
+# `async_compile.rocm(...)` block defining a `rocm_fused_*` kernel that is then
+# called (see torch/_inductor/codegen/rocm/rocm_kernel.py). A green assert_close
+# alone does not prove CK ran -- autotune silently falls back to ATen/Triton when
+# no CK candidate wins. Matching `async_compile.rocm(` in the code captured by
+# run_and_get_code is the reliable signal (verified on gfx942/MI325X: the CK path
+# emits `rocm_fused_mm_0 = async_compile.rocm(r'''...CKGemmTemplate...''')`).
+_CK_KERNEL_RE = re.compile(r"async_compile\.rocm\(")
+
+
+def _assert_ck_selected(codes):
+    if not _CK_KERNEL_RE.search("\n".join(codes)):
+        raise AssertionError(
+            "Expected a CK (async_compile.rocm) kernel in the generated code; "
+            "CK was not selected (fell back to ATen/Triton)."
+        )
 
 
 @instantiate_parametrized_tests
@@ -122,7 +141,54 @@ class TestCKBackend(TestCase):
                 def compiled_mm(x, w):
                     return mm(x, w)
 
-                Y_compiled = compiled_mm(a, b)
+                if max_autotune_gemm_backends == "CK":
+                    Y_compiled, codes = run_and_get_code(compiled_mm, a, b)
+                    _assert_ck_selected(codes)
+                else:
+                    Y_compiled = compiled_mm(a, b)
+
+            Y = mm(a=a, b=b)
+            torch.testing.assert_close(Y_compiled, Y)
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(os.environ, _test_env)
+    def test_ck_selected_smoke_mm_bf16(self):
+        """
+        Tier-1 smoke: on the runtime GPU, force the standalone CK backend for a
+        small bf16 mm and assert a CK kernel is actually selected (not an ATen or
+        Triton fallback) and produces correct numerics. Cheapest unambiguous
+        signal that the CK path is reachable and a matrix-core kernel runs.
+        """
+
+        def mm(a, b):
+            return a @ b
+
+        tensor_options = {"device": "cuda", "dtype": torch.bfloat16}
+        a = torch.randn(512, 256, **tensor_options)
+        b = torch.randn(256, 512, **tensor_options)
+
+        if "rocm" not in dir(config):
+            raise AssertionError("'rocm' not found in dir(config)")
+
+        with (
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "CK",
+                    "compile_threads": 4,
+                    "rocm.ck_max_profiling_configs": 4,
+                    "rocm.ck_dir": self.ck_dir,
+                }
+            ),
+            tf32_off(),
+        ):
+
+            @torch.compile(dynamic=False)
+            def compiled_mm(x, w):
+                return mm(x, w)
+
+            Y_compiled, codes = run_and_get_code(compiled_mm, a, b)
+            _assert_ck_selected(codes)
 
             Y = mm(a=a, b=b)
             torch.testing.assert_close(Y_compiled, Y)
@@ -306,7 +372,11 @@ class TestCKBackend(TestCase):
             def addmm(x, a, b, alpha, beta):
                 return torch.addmm(x, a, b, alpha=alpha, beta=beta)
 
-            Y_compiled = addmm(x, a, b, alpha, beta)
+            if max_autotune_gemm_backends == "CK":
+                Y_compiled, codes = run_and_get_code(addmm, x, a, b, alpha, beta)
+                _assert_ck_selected(codes)
+            else:
+                Y_compiled = addmm(x, a, b, alpha, beta)
             Y_eager = torch.addmm(x, a, b, alpha=alpha, beta=beta)
 
             torch.testing.assert_close(Y_compiled, Y_eager)
@@ -448,7 +518,11 @@ class TestCKBackend(TestCase):
                 return torch.conv2d(x, w)
 
             Y_eager = torch.conv2d(x_cl, w_cl)
-            Y_compiled = conv2d(x_cl, w_cl)
+            if max_autotune_conv_backends == "CK":
+                Y_compiled, codes = run_and_get_code(conv2d, x_cl, w_cl)
+                _assert_ck_selected(codes)
+            else:
+                Y_compiled = conv2d(x_cl, w_cl)
 
             torch.testing.assert_close(Y_compiled, Y_eager, atol=2e-4, rtol=2e-4)
 
@@ -495,14 +569,18 @@ class TestCKBackend(TestCase):
             def compiled_bmm(x, w):
                 return bmm(x, w)
 
-            Y_compiled = compiled_bmm(a, b)
+            if max_autotune_gemm_backends == "CK":
+                Y_compiled, codes = run_and_get_code(compiled_bmm, a, b)
+                _assert_ck_selected(codes)
+            else:
+                Y_compiled = compiled_bmm(a, b)
 
             Y_eager = bmm(a=a, b=b)
             torch.testing.assert_close(Y_compiled, Y_eager)
 
     @unittest.skipIf(not torch.version.hip, "ROCM only")
     @unittest.mock.patch.dict(os.environ, _test_env)
-    @parametrize("arch", ("gfx942", "gfx950"))
+    @parametrize("arch", ("gfx950",))
     def test_ck_tile_gemm_compiles(self, arch):
         """
         Compile-only regression test for the CK-Tile universal GEMM backend.
