@@ -302,9 +302,24 @@ class CKTileGemmTemplate(CKTileTemplate):
             layout=layout,
         )
 
-    def _device_arch(self) -> str:
-        """Base gfx arch string (e.g. "gfx1250") of the target device, or "" if
-        it cannot be determined."""
+    def _target_arch(self) -> str:
+        """Base gfx arch string (e.g. "gfx1250") of the *compile target*, or "" if
+        it cannot be determined.
+
+        This must match the arch that ``compile_command`` passes to
+        ``--offload-arch`` (``config.rocm.arch``), NOT the physical runtime
+        device -- otherwise the rendered source (WMMA macros, warp tile) can be
+        emitted for one arch and compiled for another. Precedence mirrors
+        ``use_ck_template``: ``config.rocm.arch`` wins; the native device arch is
+        only a fallback when it is unset.
+        """
+        if config.rocm.arch:
+            # A single instance is rendered for one arch; a fat multi-arch list
+            # (e.g. gfx942;gfx950;gfx1250) is ambiguous here, so take the first.
+            # The real autotune path compiles per concrete arch, so this is exact
+            # in practice.
+            return config.rocm.arch[0].split(":")[0]
+
         from ...utils import _rocm_native_device_arch_name
 
         for node in (self.output_node, *self.input_nodes):
@@ -314,7 +329,7 @@ class CKTileGemmTemplate(CKTileTemplate):
         return ""
 
     def _is_gfx1250(self) -> bool:
-        return self._device_arch() == "gfx1250"
+        return self._target_arch() == "gfx1250"
 
     def _threads_per_warp(self) -> int:
         # gfx1250 executes wave32; gfx9 arches are wave64.
