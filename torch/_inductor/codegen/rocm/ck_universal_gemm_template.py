@@ -1021,3 +1021,190 @@ class CKGemmTemplate(CKTemplate):
             return B, M, N, K, LDA, LDB, LDC, LDD
         else:
             return M, N, K, LDA, LDB, LDC, LDD
+
+
+class CKWMMAGemmTemplate(CKGemmTemplate):
+    """gfx1250 fat-tile WMMA classic universal-GEMM backend.
+
+    A thin subclass of ``CKGemmTemplate`` that enumerates CK's shipped WMMA
+    universal-GEMM instances (``DeviceGemm_Wmma_CShuffleV3``, all 16x16 warp,
+    fp16/bf16) and renders them through the bias-capable
+    ``DeviceGemmMultipleD_Wmma_CShuffleV3`` device op. ``filter_op``,
+    ``_get_kBatch``, ``size_args`` and ``render`` are reused verbatim; only the
+    instance source, the emitted struct name, the device-op header and the
+    profiling-config cap differ. Non-batched only (no WMMA batched instances).
+    """
+
+    def __init__(
+        self,
+        input_nodes: list[Buffer],
+        layout: Layout,
+        alpha: float,
+        beta: float,
+        input_reorder: list[int] | None = None,
+    ) -> None:
+        super().__init__(
+            input_nodes,
+            layout,
+            alpha=alpha,
+            beta=beta,
+            input_reorder=input_reorder,
+        )
+        if self.is_batched:
+            raise AssertionError("CKWMMAGemmTemplate does not support batched GEMM")
+        self.name = "ck_wmma_gemm_template"
+
+    def _target_arch(self) -> str:
+        """Base gfx arch string of the *compile target*, or "" if undeterminable.
+
+        Must match the arch ``compile_command`` passes to ``--offload-arch``
+        (``config.rocm.arch``), NOT the physical runtime device -- otherwise WMMA
+        source can be rendered for one arch and compiled for another. Precedence
+        mirrors ``use_ck_template``: ``config.rocm.arch`` wins, the native device
+        arch is only a fallback.
+        """
+        if config.rocm.arch:
+            return config.rocm.arch[0].split(":")[0]
+
+        from ...utils import _rocm_native_device_arch_name
+
+        for node in (self.output_node, *self.input_nodes):
+            device = node.get_layout().device
+            if device is not None and device.type == "cuda":
+                return _rocm_native_device_arch_name(device).split(":")[0]
+        return ""
+
+    def _is_gfx1250(self) -> bool:
+        return self._target_arch() == "gfx1250"
+
+    def header(self) -> IndentedBuffer:
+        # CK_USE_WMMA must be defined BEFORE any CK header is included.
+        # ck/host_utility/flush_cache.hpp guards an XDL-only debug block with
+        # `#if !defined(CK_USE_WMMA)`; that block dereferences gemm_args.p_a_grid,
+        # a member the WMMA gridwise Argument does not have. The block lives in a
+        # template body, so it is type-checked on instantiation even though its
+        # enclosing `if(EnvIsEnabled(CK_LOGGING))` is false at runtime -- without
+        # the define the WMMA instance fails to compile. CK_USE_WMMA is normally a
+        # cmake knob in ck/config.h, which is not shipped in the ck4inductor wheel.
+        res = IndentedBuffer()
+        res.splice(
+            """
+                // CK WMMA build switch (see comment in CKWMMAGemmTemplate.header)
+                #ifndef CK_USE_WMMA
+                #define CK_USE_WMMA 1
+                #endif
+            """
+        )
+        # Skip CKGemmTemplate.header() (which pulls the XDL device op); emit the
+        # WMMA MultipleD device op instead, on top of the shared CKTemplate header.
+        res.splice(CKTemplate.header(self).getvalue())
+        res.splice(
+            """
+                // CK WMMA GEMM header(s)
+
+                #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_wmma_cshuffle_v3.hpp"
+            """
+        )
+        return res
+
+    def emit_ck_instance(self, op: "CKGemmOperation"):
+        # Render through the WMMA MultipleD device op. The base hardcodes its own
+        # struct name inline, so this mirrors the base serializer rather than
+        # delegating to it; struct_name is the only difference.
+        struct_name = "DeviceGemmMultipleD_Wmma_CShuffleV3"
+        template_definition = r"""
+    // Gemm operator {{operation_name}}
+    using Operation_{{operation_name}} =
+        ck::tensor_operation::device::{{struct_name}}<
+            {{template_params}}>;
+
+"""
+        template_type = r"""
+    Operation_{{operation_name}}
+"""
+        template_params = []
+        for field_name, field_value in op.dict_items():
+            if isinstance(field_value, tuple):
+                tuple_elements = ", ".join(map(str, iter(field_value)))
+                if "ds" in field_name:
+                    arg = f"/* {field_name} */ Tuple<{tuple_elements}>"
+                else:
+                    arg = f"/* {field_name} */ S<{tuple_elements}>"
+                template_params.append(arg)
+            else:
+                if field_value is not None:
+                    template_params.append(f"/* {field_name} */ {field_value}")
+        operation_name = op.name().replace("(", "").replace(",", "").replace(")", "")
+        return self._template_from_string(template_definition).render(
+            operation_name=operation_name,
+            template_params=(",\n" + 12 * " ").join(template_params),
+            struct_name=struct_name,
+        ), self._template_from_string(template_type).render(
+            operation_name=operation_name
+        )
+
+    def gen_ops(self) -> list[InductorROCmOp]:
+        """Enumerate the shipped WMMA universal-GEMM instances, filtered and capped
+        independently of the classic ``CK`` pool via ``ck_wmma_max_profiling_configs``."""
+        # WMMA instances only exist for gfx1250. The lowering gate already checks
+        # this, but enforce it here too so the template is safe to call directly
+        # and can never emit WMMA source for a non-WMMA compile target.
+        if not self._is_gfx1250():
+            return []
+
+        try:
+            from ck4inductor.universal_gemm.gen_instances import (  # type: ignore[import]
+                gen_ops_library_wmma,
+            )
+        except ImportError:
+            # Older ck4inductor wheel without the WMMA enumerator: degrade to no
+            # WMMA choices (autotune falls back to whatever else is enabled).
+            return []
+
+        rops = gen_ops_library_wmma()
+        ops = []
+        for o in rops:
+            for kBatch in self._get_kBatch(o):
+                # pyrefly: ignore [bad-argument-type]
+                ops.append(InductorROCmOp(op=o, kBatch=kBatch))
+
+        filtered_instances = list(filter(lambda op: self.filter_op(op), ops))
+
+        random.seed(-11)
+        cap = config.rocm.ck_wmma_max_profiling_configs
+        chosen_instances = (
+            random.sample(filtered_instances, min(len(filtered_instances), cap))
+            if cap
+            else filtered_instances
+        )
+        log.debug(
+            "generated %d ck wmma instances after filter: %s",
+            len(chosen_instances),
+            chosen_instances,
+        )
+        return chosen_instances
+
+    @staticmethod
+    def add_ck_wmma_gemm_choices(
+        choices,
+        layout,
+        input_nodes,
+        alpha=1,
+        beta=0,
+        input_reorder=None,
+    ):
+        """Add gfx1250 WMMA universal-GEMM instance choices to the auto-tuning list."""
+        template = CKWMMAGemmTemplate(
+            input_nodes,
+            layout,
+            alpha=alpha,
+            beta=beta,
+            input_reorder=input_reorder,
+        )
+        ops = template.gen_ops()
+        for op in ops:
+            template.maybe_append_choice(
+                choices,
+                op=op.op,
+                kBatch=op.kBatch,
+            )
