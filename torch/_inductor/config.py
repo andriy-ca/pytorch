@@ -611,7 +611,8 @@ multi_kernel_hints: list[int] = []
 
 
 # Specify candidate backends for gemm autotune.
-# Possible choices are combinations of: ATen, Triton, CUTLASS, CUTEDSL, NVGEMM, CK, CKTILE, CPP.
+# Possible choices are combinations of: ATen, Triton, CUTLASS, CUTEDSL, NVGEMM, CK, CKTILE,
+# CKWMMA, CPP.
 # ATen: default Pytorch ATen kernels.
 # Triton: Triton templates defined in torch inductor (AMD and NVidia GPUs).
 # CUTLASS: Cutlass templates and kernels (NVidia GPUs only).
@@ -619,6 +620,7 @@ multi_kernel_hints: list[int] = []
 # NVGEMM: NVIDIA Universal GEMM via cutlass_api (NVidia GPUs only).
 # CK: Composable Kernel templates and kernels (AMD Instinct GPUs only).
 # CKTILE: Composable Kernel templates and kernels, new API (AMD Instinct GPUs only).
+# CKWMMA: Composable Kernel WMMA universal-GEMM templates for gfx1250 (RDNA/gfx12 only).
 # CPP: CPP templates and kernels for CPU.
 max_autotune_gemm_backends = os.environ.get(
     "TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,TRITON,CPP"
@@ -2655,6 +2657,10 @@ class rocm:
     # Number of op instance choices to trade off between runtime perf and compilation time
     # For CK-Tile Kernels
     ck_tile_max_profiling_configs: int | None = None
+
+    # Number of op instance choices to trade off between runtime perf and compilation time
+    # For CK WMMA Kernels (gfx1250 classic-GEMM WMMA backend)
+    ck_wmma_max_profiling_configs: int | None = None
 
     # Flag to use a short list of CK instances which perform well across a variety of shapes.
     # Currently RCR and F16 only
