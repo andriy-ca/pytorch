@@ -2803,6 +2803,38 @@ def _warn_missing_ck_header(header: str) -> None:
         )
 
 
+def _ck_compile_target_arch(layout: Layout) -> str:
+    """Base gfx arch string (e.g. "gfx1250") of the *compile target* for CK codegen.
+
+    Precedence mirrors ``use_ck_template``: an explicit ``config.rocm.arch`` wins
+    (take the first entry of a fat multi-arch list), the native device arch is only
+    a fallback when it is unset. This must key off the compile target, not the
+    physical device, so an arch-gated backend is never emitted for the wrong arch.
+    """
+    if config.rocm.arch:
+        return config.rocm.arch[0].split(":")[0]
+    return _rocm_native_device_arch_name(layout.device).split(":")[0]
+
+
+@functools.lru_cache(None)
+def _warn_ck_xdl_on_gfx1250() -> None:
+    """One-time, actionable warning when the classic ``CK`` backend is requested on
+    gfx1250 without a WMMA-capable token. The classic XDL instances are largely
+    unsupported there (CK's WMMA/is_gfx12 gate rejects them at runtime, so every
+    choice scores +inf and CK-forced lowerings raise NoValidChoicesError).
+
+    Diagnostic only: it never changes the gate's return value. Cached so it fires
+    once per process, not per lowering.
+    """
+    log.warning(
+        "Composable Kernel 'CK' backend is enabled on gfx1250, but the classic "
+        "XDL universal-GEMM instances are largely unsupported there and are "
+        "rejected at runtime (choices score +inf; CK-forced lowerings raise "
+        "NoValidChoicesError). Add 'CKWMMA' (classic GEMM) and/or 'CKTILE' to "
+        "TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS to get working gfx1250 kernels."
+    )
+
+
 def use_ck_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
     from .virtualized import V
 
@@ -2815,6 +2847,15 @@ def use_ck_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
         # Classic CK: ck/ck.hpp pulls ck/config.h transitively.
         _warn_missing_ck_header("ck/ck.hpp")
         _warn_missing_ck_header("ck/config.h")
+        # On gfx1250, plain CK (XDL) yields no usable classic-GEMM kernels unless a
+        # WMMA-capable token is also requested; point the user at the fix. Suppressed
+        # when CKWMMA or CKTILE is already in the backend list.
+        if (
+            _ck_compile_target_arch(layout) == "gfx1250"
+            and not _use_autotune_backend("CKWMMA")
+            and not _use_autotune_backend("CKTILE")
+        ):
+            _warn_ck_xdl_on_gfx1250()
     return enabled
 
 
@@ -2828,6 +2869,23 @@ def use_ck_tile_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
     )
     if enabled:
         _warn_missing_ck_header("ck_tile/core.hpp")
+    return enabled
+
+
+def use_ck_wmma_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
+    from .virtualized import V
+
+    enabled = (
+        _use_autotune_backend("CKWMMA")
+        and use_ck_template(layout)
+        # WMMA universal-GEMM instances only exist for gfx1250; gate strictly on the
+        # compile target so WMMA source is never emitted for a non-WMMA arch.
+        and _ck_compile_target_arch(layout) == "gfx1250"
+        and V.graph.sizevars.optimization_hint(m * n * k, fallback=-1) > 0
+    )
+    if enabled:
+        _warn_missing_ck_header("ck/ck.hpp")
+        _warn_missing_ck_header("ck/config.h")
     return enabled
 
 

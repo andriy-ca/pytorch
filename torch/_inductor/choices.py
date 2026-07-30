@@ -308,7 +308,11 @@ class InductorChoices:
         # TODO(coconutruben): remove this once CPP,CK,CUTLASS are supported
         if _use_autotune_backend("CUTLASS"):
             return True
-        if _use_autotune_backend("CK") or _use_autotune_backend("CKTILE"):
+        if (
+            _use_autotune_backend("CK")
+            or _use_autotune_backend("CKTILE")
+            or _use_autotune_backend("CKWMMA")
+        ):
             return True
         if _use_autotune_backend("CPP"):
             return True

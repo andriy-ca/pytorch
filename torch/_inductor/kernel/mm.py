@@ -23,7 +23,10 @@ from torch.utils._ordered_set import OrderedSet
 from .. import config as inductor_config, distributed_autotune
 from ..codegen.cutlass.gemm_template import CUTLASS2xGemmTemplate, CUTLASS3xGemmTemplate
 from ..codegen.rocm.ck_tile_universal_gemm_template import CKTileGemmTemplate
-from ..codegen.rocm.ck_universal_gemm_template import CKGemmTemplate
+from ..codegen.rocm.ck_universal_gemm_template import (
+    CKGemmTemplate,
+    CKWMMAGemmTemplate,
+)
 from ..codegen.subgraph import SubgraphChoiceCaller, SubgraphTemplate
 from ..ir import Buffer, ChoiceCaller, is_triton, Layout
 from ..kernel_inputs import MMKernelInputs
@@ -48,6 +51,7 @@ from ..utils import (
     use_aten_gemm_kernels,
     use_ck_gemm_template,
     use_ck_tile_gemm_template,
+    use_ck_wmma_gemm_template,
     use_cpp_gemm_template,
     use_cutlass_template,
     use_decompose_k_choice,
@@ -463,6 +467,10 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
 
     if out_dtype is None and is_nonzero and use_ck_gemm_template(layout, m, n, k):
         CKGemmTemplate.add_ck_gemm_choices(choices, layout, kernel_inputs.nodes())
+    if out_dtype is None and is_nonzero and use_ck_wmma_gemm_template(layout, m, n, k):
+        CKWMMAGemmTemplate.add_ck_wmma_gemm_choices(
+            choices, layout, kernel_inputs.nodes()
+        )
     if out_dtype is None and is_nonzero and use_ck_tile_gemm_template(layout, m, n, k):
         CKTileGemmTemplate.add_choices(choices, layout, kernel_inputs.nodes())
 
@@ -727,6 +735,18 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
 
     if is_nonzero and use_ck_gemm_template(layout, m, n, k):
         CKGemmTemplate.add_ck_gemm_choices(
+            choices,
+            layout,
+            # reorder here because CK expects (x, w, bias) but torch
+            # is bias, x, w
+            kernel_inputs.nodes(reorder=[1, 2, 0]),
+            alpha=alpha,
+            beta=beta,
+            input_reorder=[2, 0, 1],
+        )
+
+    if is_nonzero and use_ck_wmma_gemm_template(layout, m, n, k):
+        CKWMMAGemmTemplate.add_ck_wmma_gemm_choices(
             choices,
             layout,
             # reorder here because CK expects (x, w, bias) but torch
