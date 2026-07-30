@@ -70,6 +70,22 @@ def _assert_cktile_selected(codes):
         )
 
 
+# A selected CK WMMA kernel embeds the WMMA instance alias
+# `ck_devicegemm_multid_wmma_shuffle_v3_*` (see CKGemmOperation.name() with
+# is_wmma=True). More specific than _CK_KERNEL_RE (which also matches the classic
+# XDL CKGemmTemplate), so it distinguishes WMMA from classic-XDL CK.
+_CKWMMA_KERNEL_RE = re.compile(r"ck_devicegemm_multid_wmma_shuffle_v3_")
+
+
+def _assert_ckwmma_selected(codes):
+    if not _CKWMMA_KERNEL_RE.search("\n".join(codes)):
+        raise AssertionError(
+            "Expected a CK WMMA (ck_devicegemm_multid_wmma_shuffle_v3_) kernel in "
+            "the generated code; WMMA was not selected (fell back to "
+            "ATen/Triton/classic-XDL-CK/CK-Tile)."
+        )
+
+
 @instantiate_parametrized_tests
 class TestCKBackend(TestCase):
     def setUp(self):
@@ -104,10 +120,11 @@ class TestCKBackend(TestCase):
     @unittest.mock.patch.dict(os.environ, _test_env)
     @parametrize(
         "max_autotune_gemm_backends",
-        ("CK", "CKTILE", "ATen,CK"),
+        ("CK", "CKTILE", "CKWMMA", "ATen,CK"),
         name_fn=lambda b: {
             "CK": "standalone_ck",
             "CKTILE": "standalone_cktile",
+            "CKWMMA": "standalone_ckwmma",
             "ATen,CK": "fallback",
         }[b],
     )
@@ -119,6 +136,13 @@ class TestCKBackend(TestCase):
         """
         Make sure autotuning mm doesn't crash.
         """
+        # CKWMMA is a single-token value: on non-gfx1250 the WMMA gate yields zero
+        # choices and there is no ATen fallback in the list, so there is nothing to
+        # select. Skip it off gfx1250 (the two/three-token values degrade fine).
+        if max_autotune_gemm_backends == "CKWMMA":
+            runtime_arch = torch.cuda.get_device_properties(0).gcnArchName
+            if "gfx1250" not in runtime_arch:
+                self.skipTest(f"CKWMMA requires gfx1250, got {runtime_arch}")
 
         def mm(a, b):
             return a @ b
@@ -140,6 +164,7 @@ class TestCKBackend(TestCase):
                     "compile_threads": 16,
                     "rocm.ck_max_profiling_configs": 8,
                     "rocm.ck_tile_max_profiling_configs": 8,
+                    "rocm.ck_wmma_max_profiling_configs": 8,
                     "rocm.ck_dir": self.ck_dir,
                 }
             ),
@@ -159,6 +184,9 @@ class TestCKBackend(TestCase):
                 if max_autotune_gemm_backends == "CK":
                     Y_compiled, codes = run_and_get_code(compiled_mm, a, b)
                     _assert_ck_selected(codes)
+                elif max_autotune_gemm_backends == "CKWMMA":
+                    Y_compiled, codes = run_and_get_code(compiled_mm, a, b)
+                    _assert_ckwmma_selected(codes)
                 else:
                     Y_compiled = compiled_mm(a, b)
 
@@ -264,8 +292,13 @@ class TestCKBackend(TestCase):
     @unittest.mock.patch.dict(os.environ, _test_env)
     @parametrize(
         "max_autotune_gemm_backends",
-        ("CK", "ATen,CK"),
-        name_fn=lambda b: "standalone" if b == "CK" else "fallback",
+        ("CK", "CKTILE", "CKWMMA", "ATen,CK"),
+        name_fn=lambda b: {
+            "CK": "standalone_ck",
+            "CKTILE": "standalone_cktile",
+            "CKWMMA": "standalone_ckwmma",
+            "ATen,CK": "fallback",
+        }[b],
     )
     @parametrize("autotune_in_subproc", (True,))
     def test_max_autotune_precompile_matmul_dynamic(
@@ -274,6 +307,10 @@ class TestCKBackend(TestCase):
         """
         Test matmul with dynamic shapes
         """
+        if max_autotune_gemm_backends == "CKWMMA":
+            runtime_arch = torch.cuda.get_device_properties(0).gcnArchName
+            if "gfx1250" not in runtime_arch:
+                self.skipTest(f"CKWMMA requires gfx1250, got {runtime_arch}")
 
         tensor_options = {"device": "cuda", "dtype": torch.bfloat16}
 
@@ -294,6 +331,7 @@ class TestCKBackend(TestCase):
                     "compile_threads": 16,
                     "rocm.ck_max_profiling_configs": 8,
                     "rocm.ck_tile_max_profiling_configs": 8,
+                    "rocm.ck_wmma_max_profiling_configs": 8,
                     "rocm.ck_dir": self.ck_dir,
                 }
             ),
@@ -304,7 +342,11 @@ class TestCKBackend(TestCase):
             def compiled_mm(a, b):
                 return a @ b
 
-            Y_compiled = compiled_mm(a, b)
+            if max_autotune_gemm_backends == "CKWMMA":
+                Y_compiled, codes = run_and_get_code(compiled_mm, a, b)
+                _assert_ckwmma_selected(codes)
+            else:
+                Y_compiled = compiled_mm(a, b)
             Y = a @ b
             torch.testing.assert_close(Y_compiled, Y)
 
@@ -396,8 +438,8 @@ class TestCKBackend(TestCase):
     @unittest.mock.patch.dict(os.environ, _test_env)
     @parametrize(
         "max_autotune_gemm_backends",
-        ("CK", "ATen,CK"),
-        name_fn=lambda b: "standalone" if b == "CK" else "fallback",
+        ("CK,CKWMMA", "ATen,CK"),
+        name_fn=lambda b: "standalone" if b == "CK,CKWMMA" else "fallback",
     )
     @parametrize(
         "x_shape",
@@ -430,6 +472,7 @@ class TestCKBackend(TestCase):
                     "compile_threads": 2,
                     "rocm.ck_dir": self.ck_dir,
                     "rocm.ck_max_profiling_configs": 2,
+                    "rocm.ck_wmma_max_profiling_configs": 2,
                 }
             ),
             tf32_off(),
@@ -439,7 +482,10 @@ class TestCKBackend(TestCase):
             def addmm(x, a, b, alpha, beta):
                 return torch.addmm(x, a, b, alpha=alpha, beta=beta)
 
-            if max_autotune_gemm_backends == "CK":
+            # CK-forced (no ATen fallback), so either token winning is a pass: CK's
+            # gfx1250 gate still accepts 16x16 2-byte XDL instances, so an XDL win
+            # there is legitimate. WMMA-only selection is covered by the smoke test.
+            if max_autotune_gemm_backends == "CK,CKWMMA":
                 Y_compiled, codes = run_and_get_code(addmm, x, a, b, alpha, beta)
                 _assert_ck_selected(codes)
             else:
@@ -771,6 +817,306 @@ class TestCKBackend(TestCase):
                 f"Reproduce: {command}\n--- compiler output (truncated) ---\n"
                 f"{out[-4000:]}"
             )
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(os.environ, _test_env)
+    @parametrize(
+        "dtype",
+        (torch.float16, torch.bfloat16),
+        name_fn=lambda d: {torch.float16: "float16", torch.bfloat16: "bfloat16"}[d],
+    )
+    def test_ckwmma_selected_smoke_mm(self, dtype):
+        """
+        Tier-1 smoke for the gfx1250 CKWMMA backend: force the standalone CKWMMA
+        backend for a small mm and assert a WMMA kernel is actually selected (not
+        ATen/Triton/classic-XDL-CK/CK-Tile) and produces correct numerics. The
+        shape (M=N=512, K=256, Row/Row/Row = mk_kn_mn) is served by shipped WMMA
+        instances: block tiles 128/256 divide M/N and K=256 is a multiple of both
+        kpb 32 and 64, so a WMMA candidate must win when the backend works.
+
+        Parametrized over float16 AND bfloat16: both ship as WMMA instances, and
+        this is the CI regression guard for dtype-token drift (the class of bug
+        where fp16 was tagged "FP16" not "F16" and silently filtered out). A
+        bf16-only test would stay green through such a bug.
+        """
+        runtime_arch = torch.cuda.get_device_properties(0).gcnArchName
+        if "gfx1250" not in runtime_arch:
+            self.skipTest(f"CKWMMA requires gfx1250, got {runtime_arch}")
+
+        def mm(a, b):
+            return a @ b
+
+        tensor_options = {"device": "cuda", "dtype": dtype}
+        a = torch.randn(512, 256, **tensor_options)
+        b = torch.randn(256, 512, **tensor_options)
+
+        if "rocm" not in dir(config):
+            raise AssertionError("'rocm' not found in dir(config)")
+
+        with (
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "CKWMMA",
+                    "compile_threads": 4,
+                    "rocm.ck_wmma_max_profiling_configs": 8,
+                    "rocm.ck_dir": self.ck_dir,
+                }
+            ),
+            tf32_off(),
+        ):
+
+            @torch.compile(dynamic=False)
+            def compiled_mm(x, w):
+                return mm(x, w)
+
+            Y_compiled, codes = run_and_get_code(compiled_mm, a, b)
+            _assert_ckwmma_selected(codes)
+
+            Y = mm(a=a, b=b)
+            torch.testing.assert_close(Y_compiled, Y)
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(os.environ, _test_env)
+    @parametrize("arch", ("gfx1250",))
+    def test_ck_wmma_gemm_compiles(self, arch):
+        """
+        Compile-only regression test for the gfx1250 CKWMMA universal GEMM backend.
+
+        Renders the HIP source for a representative WMMA GEMM instance from each
+        (pipeline_version, scheduler) stratum and cross-compiles each with hipcc
+        (object only, no device execution), asserting that *every* stratum compiles
+        for gfx1250. Runs on any GPU (gfx9 CI included) since it patches
+        config.rocm.arch rather than executing on device.
+
+        This catches the silent-breakage class where a CK API change makes WMMA
+        instances fail to compile -- the autotuner would then prune them and fall
+        back, hiding the break. Covering each stratum ensures a break confined to a
+        single variant is still caught.
+        """
+        import subprocess
+        import tempfile
+        from collections import defaultdict
+
+        from torch._inductor.codegen.rocm.ck_universal_gemm_template import (
+            CKWMMAGemmTemplate,
+        )
+        from torch._inductor.codegen.rocm.compile_command import rocm_compile_command
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.ir import Buffer, FixedLayout
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        ck_dir = os.environ.get("TORCHINDUCTOR_CK_DIR") or self.ck_dir
+
+        dtype = torch.bfloat16
+        # mk_kn_mn shape (Row/Row/Row) served by shipped WMMA instances.
+        M, N, K = 512, 512, 256
+        device = torch.device("cuda")
+        compile_timeout_s = 600
+
+        gm = make_fx(lambda: torch.zeros(1))()
+        graph = GraphLowering(gm)
+
+        sources = []
+        with (
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "rocm.arch": [arch],
+                    "rocm.ck_dir": ck_dir,
+                }
+            ),
+            V.set_graph_handler(graph),
+        ):
+            x = Buffer(name="X", layout=FixedLayout(device, dtype, [M, K], [K, 1]))
+            w = Buffer(name="W", layout=FixedLayout(device, dtype, [K, N], [N, 1]))
+            out_layout = FixedLayout(device, dtype, [M, N], [N, 1])
+
+            template = CKWMMAGemmTemplate([x, w], out_layout, alpha=1, beta=0)
+
+            by_stratum = defaultdict(list)
+            for op_info in template.gen_ops():
+                op = op_info.op
+                by_stratum[
+                    (op.block_gemm_pipeline_version, op.block_gemm_pipeline_scheduler)
+                ].append(op_info)
+            self.assertGreater(
+                len(by_stratum), 0, f"No CKWMMA instances were generated for {arch}"
+            )
+
+            dtype_lookup = {
+                "X": dtype,
+                "W": dtype,
+                template.output_node.get_name(): dtype,
+            }
+
+            with unittest.mock.patch.object(
+                V.graph, "get_dtype", lambda name: dtype_lookup[name]
+            ):
+                for stratum, op_list in sorted(by_stratum.items()):
+                    op_info = op_list[0]
+                    caller = template.generate(op=op_info.op, kBatch=op_info.kBatch)
+                    sources.append(
+                        (stratum, op_info.op.name(), caller.bmreq.source_code)
+                    )
+
+        def compile_object(source):
+            with tempfile.NamedTemporaryFile("w", suffix=".cu", delete=False) as f:
+                f.write(source)
+                src_path = f.name
+            obj_path = src_path + ".o"
+            command = rocm_compile_command([src_path], obj_path, "o")
+            try:
+                proc = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=compile_timeout_s,
+                )
+                rc, out = proc.returncode, proc.stderr or proc.stdout
+            except subprocess.TimeoutExpired:
+                rc, out = 1, f"timed out after {compile_timeout_s}s"
+            finally:
+                for p in (src_path, obj_path):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            return rc, command, out
+
+        failures = []
+        with config.patch({"rocm.arch": [arch], "rocm.ck_dir": ck_dir}):
+            for stratum, name, source in sources:
+                rc, command, out = compile_object(source)
+                if rc != 0:
+                    failures.append((stratum, name, command, out))
+
+        if failures:
+            stratum, name, command, out = failures[0]
+            # Surface the actual diagnostics: hipcc prints the `error:` lines early,
+            # so a plain tail-truncation hides the root cause behind template spew.
+            diag = "\n".join(
+                line for line in out.splitlines() if "error:" in line.lower()
+            )[:3000]
+            self.fail(
+                f"{len(failures)}/{len(sources)} CKWMMA (pipeline_version, scheduler) "
+                f"strata failed to compile for {arch} "
+                f"(failed strata: {[f[0] for f in failures]}); the CKWMMA backend "
+                f"is silently disabled for those.\nFirst failing instance: {name}\n"
+                f"Reproduce: {command}\n"
+                f"--- compiler error lines ---\n{diag or '(none matched)'}\n"
+                f"--- compiler output (tail) ---\n{out[-2000:]}"
+            )
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(os.environ, _test_env)
+    def test_ck_wmma_gate(self):
+        """
+        Arch-gate + discoverability-warning behavior for the CKWMMA backend. Pure
+        gate-level checks (no compilation), so it runs on any GPU.
+
+        (a) The WMMA gate is True only for the gfx1250 compile target; on gfx950 it
+            is False, CKWMMA yields zero choices, and the classic CK enumeration is
+            unchanged (no WMMA leakage into the CK token). This pins that the gate
+            keys on the compile target, so WMMA source is never emitted for a
+            non-WMMA arch.
+        (b) The one-time CK-on-gfx1250 warning fires only for plain CK on gfx1250
+            and is suppressed when CKWMMA or CKTILE is also requested, or off
+            gfx1250 -- and never changes the gate's verdict.
+        """
+        from torch._inductor.codegen.rocm.ck_universal_gemm_template import (
+            CKWMMAGemmTemplate,
+        )
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.ir import Buffer, FixedLayout
+        from torch._inductor.utils import (
+            _warn_ck_xdl_on_gfx1250,
+            use_ck_gemm_template,
+            use_ck_wmma_gemm_template,
+        )
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        device = torch.device("cuda")
+        M, N, K = 512, 512, 256
+        layout = FixedLayout(device, torch.bfloat16, [M, N], [N, 1])
+
+        # The gates consult V.graph.sizevars, so every call must run inside a graph
+        # context; without one V.graph is a NullHandler and the gate raises.
+        gm = make_fx(lambda: torch.zeros(1))()
+        graph = GraphLowering(gm)
+
+        with V.set_graph_handler(graph):
+            # (a) Arch gating.
+            with config.patch(
+                {
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "CK,CKWMMA",
+                    "rocm.arch": ["gfx1250"],
+                    "rocm.ck_dir": self.ck_dir,
+                }
+            ):
+                self.assertTrue(use_ck_wmma_gemm_template(layout, M, N, K))
+
+            with config.patch(
+                {
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "CK,CKWMMA",
+                    "rocm.arch": ["gfx950"],
+                    "rocm.ck_dir": self.ck_dir,
+                }
+            ):
+                self.assertFalse(use_ck_wmma_gemm_template(layout, M, N, K))
+                # No WMMA leakage: off gfx1250 the WMMA template yields no choices.
+                x = Buffer(
+                    name="X",
+                    layout=FixedLayout(device, torch.bfloat16, [M, K], [K, 1]),
+                )
+                w = Buffer(
+                    name="W",
+                    layout=FixedLayout(device, torch.bfloat16, [K, N], [N, 1]),
+                )
+                wmma_template = CKWMMAGemmTemplate([x, w], layout, alpha=1, beta=0)
+                self.assertEqual(len(wmma_template.gen_ops()), 0)
+
+        # (b) Warning suppression table. Also inside the graph context: the CK gate
+        # consults V.graph.sizevars too.
+        import logging
+
+        def _warns(backends, arch):
+            _warn_ck_xdl_on_gfx1250.cache_clear()
+            with (
+                V.set_graph_handler(graph),
+                config.patch(
+                    {
+                        "max_autotune": True,
+                        "max_autotune_gemm_backends": backends,
+                        "rocm.arch": [arch],
+                        "rocm.ck_dir": self.ck_dir,
+                    }
+                ),
+                self.assertLogs("torch._inductor.utils", level="WARNING") as captured,
+            ):
+                verdict = use_ck_gemm_template(layout, M, N, K)
+                # Sentinel so assertLogs never fails for "no logs"; we inspect the
+                # captured records ourselves.
+                logging.getLogger("torch._inductor.utils").warning("sentinel")
+            fired = any("Add 'CKWMMA'" in m for m in captured.output)
+            return verdict, fired
+
+        v_ck_1250, warn_ck_1250 = _warns("CK", "gfx1250")
+        self.assertTrue(warn_ck_1250)
+        _, warn_ckwmma = _warns("CK,CKWMMA", "gfx1250")
+        self.assertFalse(warn_ckwmma)
+        _, warn_cktile = _warns("CK,CKTILE", "gfx1250")
+        self.assertFalse(warn_cktile)
+        _, warn_gfx950 = _warns("CK", "gfx950")
+        self.assertFalse(warn_gfx950)
+
+        # Diagnostic-only: the warning must not change the gate verdict.
+        self.assertTrue(v_ck_1250)
 
 
 if __name__ == "__main__":
