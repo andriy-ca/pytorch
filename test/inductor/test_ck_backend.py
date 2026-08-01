@@ -86,6 +86,34 @@ def _assert_ckwmma_selected(codes):
         )
 
 
+# The batched alias is a *different* string: CKBatchedGemmOperation.name() emits
+# `ck_device_batched_gemm_multi_d_wmma_c_shuffle_v3_*`, which _CKWMMA_KERNEL_RE
+# above does not match. Asserting the non-batched pattern on a bmm test would
+# therefore never fire, and the test would pass without exercising WMMA at all.
+_CKWMMA_BATCHED_KERNEL_RE = re.compile(
+    r"ck_device_batched_gemm_multi_d_wmma_c_shuffle_v3_"
+)
+
+
+def _assert_ckwmma_batched_selected(codes):
+    if not _CKWMMA_BATCHED_KERNEL_RE.search("\n".join(codes)):
+        raise AssertionError(
+            "Expected a CK batched WMMA "
+            "(ck_device_batched_gemm_multi_d_wmma_c_shuffle_v3_) kernel in the "
+            "generated code; batched WMMA was not selected (fell back to "
+            "ATen/Triton/classic-XDL-CK)."
+        )
+
+
+def _is_gfx1250_runtime():
+    """True when the *running* device is gfx1250.
+
+    Distinct from config.rocm.arch (the compile target): used to decide whether a
+    WMMA kernel could actually have won autotune in this process.
+    """
+    return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+
+
 @instantiate_parametrized_tests
 class TestCKBackend(TestCase):
     def setUp(self):
@@ -643,8 +671,11 @@ class TestCKBackend(TestCase):
     @unittest.mock.patch.dict(os.environ, _test_env)
     @parametrize(
         "max_autotune_gemm_backends",
-        ("CK", "ATen,CK"),
-        name_fn=lambda b: "standalone" if b == "CK" else "fallback",
+        ("CK,CKWMMA", "ATen,CK"),
+        # Explicit map: the standalone slot now requests two tokens, which the
+        # previous `"standalone" if b == "CK"` lambda would have mislabelled.
+        # Both test ids are unchanged.
+        name_fn=lambda b: {"CK,CKWMMA": "standalone", "ATen,CK": "fallback"}[b],
     )
     def test_max_autotune_precompile_bmm(
         self,
@@ -652,6 +683,12 @@ class TestCKBackend(TestCase):
     ):
         """
         Test gemm-max-autotune torch.bmm with CK backend
+
+        The standalone case is CK-forced (no ATen fallback). On gfx1250 the XDL
+        instances that survive filtering are all pipeline v2, which the K-loop
+        prefetch check rejects at runtime, so every choice scores +inf; CKWMMA
+        supplies working candidates. Off gfx1250 the CKWMMA gate is False and the
+        two-token value degrades to plain CK.
         """
 
         def bmm(a, b):
@@ -672,6 +709,7 @@ class TestCKBackend(TestCase):
                     "max_autotune_gemm_backends": max_autotune_gemm_backends,
                     "compile_threads": 2,
                     "rocm.ck_max_profiling_configs": 2,
+                    "rocm.ck_wmma_max_profiling_configs": 2,
                     "rocm.ck_dir": self.ck_dir,
                 }
             ),
@@ -682,8 +720,11 @@ class TestCKBackend(TestCase):
             def compiled_bmm(x, w):
                 return bmm(x, w)
 
-            if max_autotune_gemm_backends == "CK":
+            if max_autotune_gemm_backends == "CK,CKWMMA":
                 Y_compiled, codes = run_and_get_code(compiled_bmm, a, b)
+                # A CK-family kernel must win. Which of XDL/WMMA is faster is not
+                # the contract, so this deliberately accepts either -- on gfx9 the
+                # winner is legitimately XDL.
                 _assert_ck_selected(codes)
             else:
                 Y_compiled = compiled_bmm(a, b)
@@ -878,8 +919,65 @@ class TestCKBackend(TestCase):
 
     @unittest.skipIf(not torch.version.hip, "ROCM only")
     @unittest.mock.patch.dict(os.environ, _test_env)
+    @parametrize(
+        "dtype",
+        (torch.float16, torch.bfloat16),
+        name_fn=lambda d: {torch.float16: "float16", torch.bfloat16: "bfloat16"}[d],
+    )
+    def test_ckwmma_selected_smoke_bmm(self, dtype):
+        """
+        Batched counterpart of test_ckwmma_selected_smoke_mm: force the standalone
+        CKWMMA backend for a small bmm and assert a *batched* WMMA kernel is
+        selected and numerically correct.
+
+        B is transposed, giving Row/Col/Row (gmk_gnk_gmn) -- the layout shipped for
+        batched WMMA in both dtypes. M=N=512, K=256 divide the shipped block tiles,
+        so a candidate must win when the backend works.
+        """
+        if not _is_gfx1250_runtime():
+            runtime_arch = torch.cuda.get_device_properties(0).gcnArchName
+            self.skipTest(f"CKWMMA requires gfx1250, got {runtime_arch}")
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        tensor_options = {"device": "cuda", "dtype": dtype}
+        a = torch.randn(4, 512, 256, **tensor_options)
+        b = torch.randn(4, 512, 256, **tensor_options).transpose(1, 2)
+
+        if "rocm" not in dir(config):
+            raise AssertionError("'rocm' not found in dir(config)")
+
+        with (
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "CKWMMA",
+                    "compile_threads": 4,
+                    "rocm.ck_wmma_max_profiling_configs": 8,
+                    "rocm.ck_dir": self.ck_dir,
+                }
+            ),
+            tf32_off(),
+        ):
+
+            @torch.compile(dynamic=False)
+            def compiled_bmm(x, w):
+                return bmm(x, w)
+
+            Y_compiled, codes = run_and_get_code(compiled_bmm, a, b)
+            _assert_ckwmma_batched_selected(codes)
+
+            Y = bmm(a=a, b=b)
+            torch.testing.assert_close(Y_compiled, Y)
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(os.environ, _test_env)
     @parametrize("arch", ("gfx1250",))
-    def test_ck_wmma_gemm_compiles(self, arch):
+    @parametrize(
+        "batched", (False, True), name_fn=lambda b: "batched" if b else "classic"
+    )
+    def test_ck_wmma_gemm_compiles(self, arch, batched):
         """
         Compile-only regression test for the gfx1250 CKWMMA universal GEMM backend.
 
@@ -893,6 +991,10 @@ class TestCKBackend(TestCase):
         instances fail to compile -- the autotuner would then prune them and fall
         back, hiding the break. Covering each stratum ensures a break confined to a
         single variant is still caught.
+
+        The batched variant covers the 3-D path, which resolves to a different
+        device op (DeviceBatchedGemmMultiD_Wmma_CShuffleV3) and header than the
+        classic one, and so can break independently.
         """
         import subprocess
         import tempfile
@@ -912,6 +1014,7 @@ class TestCKBackend(TestCase):
         dtype = torch.bfloat16
         # mk_kn_mn shape (Row/Row/Row) served by shipped WMMA instances.
         M, N, K = 512, 512, 256
+        B = 4
         device = torch.device("cuda")
         compile_timeout_s = 600
 
@@ -929,9 +1032,22 @@ class TestCKBackend(TestCase):
             ),
             V.set_graph_handler(graph),
         ):
-            x = Buffer(name="X", layout=FixedLayout(device, dtype, [M, K], [K, 1]))
-            w = Buffer(name="W", layout=FixedLayout(device, dtype, [K, N], [N, 1]))
-            out_layout = FixedLayout(device, dtype, [M, N], [N, 1])
+            if batched:
+                # B is column-major (as torch.bmm produces after a transpose),
+                # giving Row/Col/Row -- the layout shipped for batched WMMA.
+                x = Buffer(
+                    name="X",
+                    layout=FixedLayout(device, dtype, [B, M, K], [M * K, K, 1]),
+                )
+                w = Buffer(
+                    name="W",
+                    layout=FixedLayout(device, dtype, [B, K, N], [K * N, 1, K]),
+                )
+                out_layout = FixedLayout(device, dtype, [B, M, N], [M * N, N, 1])
+            else:
+                x = Buffer(name="X", layout=FixedLayout(device, dtype, [M, K], [K, 1]))
+                w = Buffer(name="W", layout=FixedLayout(device, dtype, [K, N], [N, 1]))
+                out_layout = FixedLayout(device, dtype, [M, N], [N, 1])
 
             template = CKWMMAGemmTemplate([x, w], out_layout, alpha=1, beta=0)
 
@@ -1001,7 +1117,8 @@ class TestCKBackend(TestCase):
                 line for line in out.splitlines() if "error:" in line.lower()
             )[:3000]
             self.fail(
-                f"{len(failures)}/{len(sources)} CKWMMA (pipeline_version, scheduler) "
+                f"{len(failures)}/{len(sources)} CKWMMA "
+                f"{'batched' if batched else 'classic'} (pipeline_version, scheduler) "
                 f"strata failed to compile for {arch} "
                 f"(failed strata: {[f[0] for f in failures]}); the CKWMMA backend "
                 f"is silently disabled for those.\nFirst failing instance: {name}\n"
@@ -1080,6 +1197,43 @@ class TestCKBackend(TestCase):
                 )
                 wmma_template = CKWMMAGemmTemplate([x, w], layout, alpha=1, beta=0)
                 self.assertEqual(len(wmma_template.gen_ops()), 0)
+
+            # The gate and the enumerator must behave the same way for the 3-D
+            # (bmm) path: enabled and non-empty on gfx1250, silent on gfx950.
+            B = 4
+            batched_layout = FixedLayout(
+                device, torch.bfloat16, [B, M, N], [M * N, N, 1]
+            )
+            batched_x = Buffer(
+                name="X",
+                layout=FixedLayout(device, torch.bfloat16, [B, M, K], [M * K, K, 1]),
+            )
+            batched_w = Buffer(
+                name="W",
+                layout=FixedLayout(device, torch.bfloat16, [B, K, N], [K * N, 1, K]),
+            )
+
+            for arch, expected in (("gfx1250", True), ("gfx950", False)):
+                with config.patch(
+                    {
+                        "max_autotune": True,
+                        "max_autotune_gemm_backends": "CK,CKWMMA",
+                        "rocm.arch": [arch],
+                        "rocm.ck_dir": self.ck_dir,
+                    }
+                ):
+                    self.assertEqual(
+                        use_ck_wmma_gemm_template(batched_layout, M, N, K), expected
+                    )
+                    batched_template = CKWMMAGemmTemplate(
+                        [batched_x, batched_w], batched_layout, alpha=1, beta=0
+                    )
+                    self.assertTrue(batched_template.is_batched)
+                    ops = batched_template.gen_ops()
+                    if expected:
+                        self.assertTrue(ops, f"no batched WMMA instances for {arch}")
+                    else:
+                        self.assertEqual(len(ops), 0)
 
         # (b) Warning suppression table. Also inside the graph context: the CK gate
         # consults V.graph.sizevars too.
