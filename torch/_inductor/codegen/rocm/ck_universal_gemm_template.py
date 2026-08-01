@@ -1027,13 +1027,31 @@ class CKWMMAGemmTemplate(CKGemmTemplate):
     """gfx1250 fat-tile WMMA classic universal-GEMM backend.
 
     A thin subclass of ``CKGemmTemplate`` that enumerates CK's shipped WMMA
-    universal-GEMM instances (``DeviceGemm_Wmma_CShuffleV3``, all 16x16 warp,
-    fp16/bf16) and renders them through the bias-capable
-    ``DeviceGemmMultipleD_Wmma_CShuffleV3`` device op. ``filter_op``,
+    universal-GEMM instances (all 16x16 warp, fp16/bf16) and renders them through
+    the bias-capable ``*MultipleD*`` WMMA device op. ``filter_op``,
     ``_get_kBatch``, ``size_args`` and ``render`` are reused verbatim; only the
     instance source, the emitted struct name, the device-op header and the
-    profiling-config cap differ. Non-batched only (no WMMA batched instances).
+    profiling-config cap differ.
+
+    Serves both ranks, keyed on ``is_batched`` exactly as the base class is:
+    2-D ``mm``/``addmm`` enumerate ``DeviceGemm_Wmma_CShuffleV3`` instances, 3-D
+    ``bmm`` enumerates ``DeviceBatchedGemm_Wmma_CShuffleV3`` ones. Both are
+    bias-less as shipped and are rendered through the corresponding MultipleD
+    device op with an empty Ds list.
     """
+
+    # Device op / header / enumerator, keyed on is_batched. The batched WMMA
+    # device op takes the same template parameters in the same order as its XDL
+    # counterpart, so only these three seams vary -- everything downstream
+    # (render, size_args, filter_op) is rank-generic already.
+    _STRUCT_NAME = {
+        False: "DeviceGemmMultipleD_Wmma_CShuffleV3",
+        True: "DeviceBatchedGemmMultiD_Wmma_CShuffleV3",
+    }
+    _DEVICE_OP_HEADER = {
+        False: "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_wmma_cshuffle_v3.hpp",
+        True: "ck/tensor_operation/gpu/device/impl/device_batched_gemm_multiple_d_wmma_cshuffle_v3.hpp",
+    }
 
     def __init__(
         self,
@@ -1050,9 +1068,11 @@ class CKWMMAGemmTemplate(CKGemmTemplate):
             beta=beta,
             input_reorder=input_reorder,
         )
-        if self.is_batched:
-            raise AssertionError("CKWMMAGemmTemplate does not support batched GEMM")
-        self.name = "ck_wmma_gemm_template"
+        self.name = (
+            "ck_wmma_batched_gemm_template"
+            if self.is_batched
+            else "ck_wmma_gemm_template"
+        )
 
     def _target_arch(self) -> str:
         """Base gfx arch string of the *compile target*, or "" if undeterminable.
@@ -1099,10 +1119,10 @@ class CKWMMAGemmTemplate(CKGemmTemplate):
         # WMMA MultipleD device op instead, on top of the shared CKTemplate header.
         res.splice(CKTemplate.header(self).getvalue())
         res.splice(
-            """
+            f"""
                 // CK WMMA GEMM header(s)
 
-                #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_wmma_cshuffle_v3.hpp"
+                #include "{self._DEVICE_OP_HEADER[self.is_batched]}"
             """
         )
         return res
@@ -1111,7 +1131,7 @@ class CKWMMAGemmTemplate(CKGemmTemplate):
         # Render through the WMMA MultipleD device op. The base hardcodes its own
         # struct name inline, so this mirrors the base serializer rather than
         # delegating to it; struct_name is the only difference.
-        struct_name = "DeviceGemmMultipleD_Wmma_CShuffleV3"
+        struct_name = self._STRUCT_NAME[self.is_batched]
         template_definition = r"""
     // Gemm operator {{operation_name}}
     using Operation_{{operation_name}} =
@@ -1153,6 +1173,9 @@ class CKWMMAGemmTemplate(CKGemmTemplate):
             return []
 
         try:
+            from ck4inductor.batched_universal_gemm.gen_instances import (  # type: ignore[import]
+                gen_ops_library_wmma as gen_batched_ops_library_wmma,
+            )
             from ck4inductor.universal_gemm.gen_instances import (  # type: ignore[import]
                 gen_ops_library_wmma,
             )
@@ -1161,7 +1184,10 @@ class CKWMMAGemmTemplate(CKGemmTemplate):
             # WMMA choices (autotune falls back to whatever else is enabled).
             return []
 
-        rops = gen_ops_library_wmma()
+        generator = (
+            gen_batched_ops_library_wmma if self.is_batched else gen_ops_library_wmma
+        )
+        rops = generator()
         ops = []
         for o in rops:
             for kBatch in self._get_kBatch(o):
