@@ -105,6 +105,27 @@ def _assert_ckwmma_batched_selected(codes):
         )
 
 
+# And conv is a *third* distinct alias: CKGroupedConvFwdOp.name() with
+# is_wmma=True emits `ck_device_grouped_convolution_fwd_multiple_abd_wmma_*`.
+# Neither GEMM pattern above matches it, and _CK_KERNEL_RE only matches
+# `async_compile.rocm(` which any ROCm kernel emits -- including plain XDL. So
+# without this regex a WMMA conv assertion passes even when no WMMA kernel
+# ran at all.
+_CKWMMA_CONV_KERNEL_RE = re.compile(
+    r"ck_device_grouped_convolution_fwd_multiple_abd_wmma_c_shuffle_v3_"
+)
+
+
+def _assert_ckwmma_conv_selected(codes):
+    if not _CKWMMA_CONV_KERNEL_RE.search("\n".join(codes)):
+        raise AssertionError(
+            "Expected a CK WMMA conv "
+            "(ck_device_grouped_convolution_fwd_multiple_abd_wmma_c_shuffle_v3_) "
+            "kernel in the generated code; WMMA conv was not selected (fell back "
+            "to ATen/Triton/classic-XDL-CK)."
+        )
+
+
 def _is_gfx1250_runtime():
     """True when the *running* device is gfx1250.
 
@@ -828,6 +849,137 @@ class TestCKBackend(TestCase):
             )
 
     @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(
+        os.environ,
+        {**_test_env, "PYTORCH_MIOPEN_SUGGEST_NHWC": "1"},
+    )
+    @parametrize(
+        "max_autotune_conv_backends",
+        ("CK,CKWMMA", "CK,CKWMMA,ATEN"),
+        # Same labels, same reasoning as test_max_autotune_conv2d_float32.
+        name_fn=lambda b: "ck_only" if b == "CK,CKWMMA" else "vs_aten",
+    )
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_max_autotune_conv2d_wmma(self, max_autotune_conv_backends, dtype):
+        """
+        f16/bf16 sibling of test_max_autotune_conv2d_float32, exercising the
+        CKWMMA token.
+
+        Meaningful on every arch, unlike a CKWMMA case bolted onto the f32 test:
+        f16/bf16 conv is a genuinely different CK code path (Wave32Force16MNPerXDL
+        applies), there is no other f16/bf16 conv coverage in this suite, and on
+        gfx9 the CKWMMA gate is simply False so the case falls back to plain CK.
+
+        The two backend values differ exactly when CK works: `ck_only` proves CK
+        produces a correct kernel unopposed; `vs_aten` additionally requires CK to
+        beat ATen on measured time, which is the only competitiveness signal here.
+        """
+        tensor_options = {"device": "cuda", "dtype": dtype}
+
+        x = torch.randn(1, 8, 56, 56, **tensor_options)
+        w = torch.randn(64, 8, 3, 3, **tensor_options)
+        x_cl = x.to(memory_format=torch.channels_last)
+        w_cl = w.to(memory_format=torch.channels_last)
+
+        with (
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "autotune_in_subproc": False,
+                    "max_autotune_conv_backends": max_autotune_conv_backends,
+                    "compile_threads": 4,
+                    "rocm.ck_dir": self.ck_dir,
+                    "rocm.ck_max_profiling_configs": 4,
+                    "rocm.ck_wmma_max_profiling_configs": 4,
+                }
+            ),
+            tf32_off(),
+        ):
+
+            @torch.compile(dynamic=False)
+            def conv2d(x, w):
+                return torch.conv2d(x, w)
+
+            Y_eager = torch.conv2d(x_cl, w_cl)
+            if "ATEN" not in max_autotune_conv_backends:
+                # CK is unopposed, so it must produce the winning kernel. On gfx9
+                # that is legitimately an XDL kernel (the CKWMMA gate is False
+                # there); asserting the WMMA alias here would make this a perf
+                # assertion. test_ckwmma_selected_smoke_conv is where "WMMA
+                # actually wins" is pinned, under a forced single backend.
+                Y_compiled, codes = run_and_get_code(conv2d, x_cl, w_cl)
+                _assert_ck_selected(codes)
+            else:
+                # ATen competes on measured time. Which kernel wins is a
+                # performance question and varies with node load, so assert
+                # numerics only -- matching test_max_autotune_conv2d_float32's treatment
+                # of its own ATen case.
+                Y_compiled = conv2d(x_cl, w_cl)
+
+            # bf16 has ~8 mantissa bits; f16 has 10, so it can be held tighter.
+            tol = 2e-2 if dtype is torch.bfloat16 else 2e-3
+            torch.testing.assert_close(Y_compiled, Y_eager, atol=tol, rtol=tol)
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(
+        os.environ,
+        {**_test_env, "PYTORCH_MIOPEN_SUGGEST_NHWC": "1"},
+    )
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_ckwmma_selected_smoke_conv(self, dtype):
+        """
+        Proves a WMMA *conv* kernel wins autotune and is numerically correct.
+
+        Forces CKWMMA alone -- excluding the CK token removes the XDL competition,
+        so a WMMA kernel must win rather than merely being allowed to. Requires
+        gfx1250 silicon, hence the explicit skip: conv auto-appends ATen when the
+        choice list is empty (the `if not choices` branch in conv.py), so
+        off-target this would quietly pass via ATen without exercising WMMA at all.
+        The skip, not the token string, is what stops the test from passing without
+        running a WMMA kernel.
+
+        Parametrized over both dtypes to catch a renamed dtype token -- the class of
+        bug where fp16 is tagged "FP16" vs "F16" and every fp16 instance is
+        silently filtered out.
+        """
+        if not _is_gfx1250_runtime():
+            runtime_arch = torch.cuda.get_device_properties(0).gcnArchName
+            self.skipTest(f"CKWMMA conv requires gfx1250, got {runtime_arch}")
+
+        tensor_options = {"device": "cuda", "dtype": dtype}
+        x = torch.randn(1, 8, 56, 56, **tensor_options).to(
+            memory_format=torch.channels_last
+        )
+        w = torch.randn(64, 8, 3, 3, **tensor_options).to(
+            memory_format=torch.channels_last
+        )
+
+        with (
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "autotune_in_subproc": False,
+                    "max_autotune_conv_backends": "CKWMMA",
+                    "compile_threads": 4,
+                    "rocm.ck_dir": self.ck_dir,
+                    "rocm.ck_wmma_max_profiling_configs": 8,
+                }
+            ),
+            tf32_off(),
+        ):
+
+            @torch.compile(dynamic=False)
+            def conv2d(x, w):
+                return torch.conv2d(x, w)
+
+            Y_eager = torch.conv2d(x, w)
+            Y_compiled, codes = run_and_get_code(conv2d, x, w)
+            _assert_ck_selected(codes)
+            _assert_ckwmma_conv_selected(codes)
+
+            torch.testing.assert_close(Y_compiled, Y_eager, atol=2e-2, rtol=2e-2)
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
     @unittest.mock.patch.dict(os.environ, _test_env)
     @parametrize(
         "max_autotune_gemm_backends",
@@ -1293,6 +1445,149 @@ class TestCKBackend(TestCase):
 
     @unittest.skipIf(not torch.version.hip, "ROCM only")
     @unittest.mock.patch.dict(os.environ, _test_env)
+    @parametrize("arch", ("gfx1250",))
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_ck_wmma_conv_compiles(self, arch, dtype):
+        """
+        Compile-only regression test for the gfx1250 CKWMMA grouped-conv backend.
+
+        Renders one representative WMMA conv instance per (pipeline_version,
+        scheduler) stratum and cross-compiles each with hipcc (object only, no
+        device execution), asserting every stratum builds for gfx1250. Patches
+        config.rocm.arch, so it runs on any GPU including gfx9 CI.
+
+        This is the CI guard for the backend: if a CK API change breaks WMMA conv
+        compilation, autotune silently prunes the broken instances and falls back,
+        so nothing else here would notice. The conv device op and header differ
+        from both GEMM ones, so it can break independently of them.
+        """
+        import subprocess
+        import tempfile
+        from collections import defaultdict
+
+        from torch._inductor.codegen.rocm.ck_conv_template import (
+            CKWMMAGroupedConvFwdTemplate,
+        )
+        from torch._inductor.codegen.rocm.compile_command import rocm_compile_command
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.ir import Buffer, FixedLayout
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        ck_dir = os.environ.get("TORCHINDUCTOR_CK_DIR") or self.ck_dir
+        device = torch.device("cuda")
+        compile_timeout_s = 600
+
+        gm = make_fx(lambda: torch.zeros(1))()
+        graph = GraphLowering(gm)
+
+        sources = []
+        with (
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "rocm.arch": [arch],
+                    "rocm.ck_dir": ck_dir,
+                    "rocm.ck_wmma_max_profiling_configs": None,
+                }
+            ),
+            V.set_graph_handler(graph),
+        ):
+            # Channels-last conv2d: NHWGC/GKYXC/NHWGK, the layout WMMA conv ships.
+            x = Buffer(
+                name="X",
+                layout=FixedLayout(device, dtype, [1, 8, 56, 56], [25088, 1, 448, 8]),
+            )
+            w = Buffer(
+                name="W",
+                layout=FixedLayout(device, dtype, [64, 8, 3, 3], [72, 1, 24, 8]),
+            )
+            out_layout = FixedLayout(
+                device, dtype, [1, 64, 54, 54], [186624, 1, 3456, 64]
+            )
+
+            template = CKWMMAGroupedConvFwdTemplate(
+                [x, w],
+                out_layout,
+                stride=[1, 1],
+                padding=[0, 0],
+                dilation=[1, 1],
+                groups=1,
+                n_spatial_dimensions=2,
+            )
+
+            by_stratum = defaultdict(list)
+            for op in template.gen_ops():
+                by_stratum[
+                    (op.block_gemm_pipeline_version, op.block_gemm_pipeline_scheduler)
+                ].append(op)
+            # A silent enumeration failure (bad packaging, renamed header) would
+            # otherwise make this pass with nothing compiled.
+            self.assertGreater(
+                len(by_stratum),
+                0,
+                f"No CKWMMA conv instances were generated for {arch}/{dtype}",
+            )
+
+            dtype_lookup = {
+                "X": dtype,
+                "W": dtype,
+                template.output_node.get_name(): dtype,
+            }
+
+            with unittest.mock.patch.object(
+                V.graph, "get_dtype", lambda name: dtype_lookup[name]
+            ):
+                for stratum, op_list in sorted(by_stratum.items()):
+                    op = op_list[0]
+                    caller = template.generate(op=op)
+                    sources.append((stratum, op.name(), caller.bmreq.source_code))
+
+        def compile_object(source):
+            with tempfile.NamedTemporaryFile("w", suffix=".cu", delete=False) as f:
+                f.write(source)
+                src_path = f.name
+            obj_path = src_path + ".o"
+            command = rocm_compile_command([src_path], obj_path, "o")
+            try:
+                proc = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=compile_timeout_s,
+                )
+                rc, out = proc.returncode, proc.stderr or proc.stdout
+            except subprocess.TimeoutExpired:
+                rc, out = 1, f"timed out after {compile_timeout_s}s"
+            finally:
+                for p in (src_path, obj_path):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            return rc, command, out
+
+        failures = []
+        with config.patch({"rocm.arch": [arch], "rocm.ck_dir": ck_dir}):
+            for stratum, name, source in sources:
+                rc, command, out = compile_object(source)
+                if rc != 0:
+                    failures.append((stratum, name, command, out))
+
+        if failures:
+            stratum, name, command, out = failures[0]
+            self.fail(
+                f"{len(failures)}/{len(sources)} CKWMMA conv "
+                f"(pipeline_version, scheduler) strata failed to compile for "
+                f"{arch}/{dtype} (failed strata: {[f[0] for f in failures]}); the "
+                f"CKWMMA conv backend is silently disabled for those.\n"
+                f"First failing instance: {name}\nReproduce: {command}\n"
+                f"--- compiler output (tail) ---\n{out[-2000:]}"
+            )
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(os.environ, _test_env)
     def test_ck_wmma_gate(self):
         """
         Arch-gate + discoverability-warning behavior for the CKWMMA backend. Pure
@@ -1398,6 +1693,83 @@ class TestCKBackend(TestCase):
                         self.assertTrue(ops, f"no batched WMMA instances for {arch}")
                     else:
                         self.assertEqual(len(ops), 0)
+
+        # (a2) The same for the CONV gate, which reads a different config key
+        # (max_autotune_conv_backends via _use_conv_autotune_backend). Wiring it
+        # to the GEMM helper would make the CKWMMA token permanently unreachable
+        # for conv -- and nothing else here would notice, since the conv smoke
+        # test skips off gfx1250 and the two-token conv test passes via plain CK.
+        from torch._inductor.codegen.rocm.ck_conv_template import (
+            CKWMMAGroupedConvFwdTemplate,
+        )
+        from torch._inductor.utils import use_ck_wmma_conv_template
+
+        conv_layout = FixedLayout(
+            device, torch.bfloat16, [1, 64, 54, 54], [186624, 1, 3456, 64]
+        )
+        with V.set_graph_handler(graph):
+            for arch, backends, expected in (
+                ("gfx1250", "CK,CKWMMA", True),
+                ("gfx950", "CK,CKWMMA", False),
+                # Opt-in: the CK token alone must never imply WMMA.
+                ("gfx1250", "CK", False),
+            ):
+                with config.patch(
+                    {
+                        "max_autotune": True,
+                        "max_autotune_conv_backends": backends,
+                        "rocm.arch": [arch],
+                        "rocm.ck_dir": self.ck_dir,
+                    }
+                ):
+                    self.assertEqual(
+                        use_ck_wmma_conv_template(conv_layout),
+                        expected,
+                        f"conv WMMA gate wrong for arch={arch} backends={backends}",
+                    )
+                    conv_template = CKWMMAGroupedConvFwdTemplate(
+                        [
+                            Buffer(
+                                name="X",
+                                layout=FixedLayout(
+                                    device,
+                                    torch.bfloat16,
+                                    [1, 8, 56, 56],
+                                    [25088, 1, 448, 8],
+                                ),
+                            ),
+                            Buffer(
+                                name="W",
+                                layout=FixedLayout(
+                                    device,
+                                    torch.bfloat16,
+                                    [64, 8, 3, 3],
+                                    [72, 1, 24, 8],
+                                ),
+                            ),
+                        ],
+                        conv_layout,
+                        stride=[1, 1],
+                        padding=[0, 0],
+                        dilation=[1, 1],
+                        groups=1,
+                        n_spatial_dimensions=2,
+                    )
+                    conv_ops = conv_template.gen_ops()
+                    if arch == "gfx1250":
+                        # gen_ops is gated on the compile target, not the token,
+                        # so it yields instances whenever the arch matches.
+                        self.assertTrue(conv_ops, f"no WMMA conv instances for {arch}")
+                        self.assertTrue(
+                            all(op.is_wmma for op in conv_ops),
+                            "non-WMMA op in the WMMA conv pool",
+                        )
+                    else:
+                        self.assertEqual(
+                            len(conv_ops),
+                            0,
+                            "WMMA conv instances leaked onto a non-gfx1250 target",
+                        )
 
         # (b) Warning suppression table. Also inside the graph context: the CK gate
         # consults V.graph.sizevars too.
