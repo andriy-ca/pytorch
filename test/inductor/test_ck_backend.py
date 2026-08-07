@@ -676,6 +676,159 @@ class TestCKBackend(TestCase):
 
     @unittest.skipIf(not torch.version.hip, "ROCM only")
     @unittest.mock.patch.dict(os.environ, _test_env)
+    @parametrize("arch", ("gfx1250", "gfx950"))
+    def test_ck_conv_gfx1250_filter(self, arch):
+        """
+        Arch-gated instance pruning for the CK grouped-conv backend.
+
+        On gfx1250 (wave32) most enumerated conv instances cannot emit a
+        matrix-core kernel: CK decides this at compile time and then rejects them
+        with a bare `return false` and no diagnostic. `filter_op` used to be
+        architecture-blind, so it handed autotune a pool that is ~92% dead on
+        that target; with a small `ck_max_profiling_configs` the sampler could
+        draw zero working candidates and raise NoValidChoicesError.
+
+        Patches `config.rocm.arch` rather than reading the physical device, so
+        this runs anywhere -- including gfx9 CI -- and pins both directions:
+        pruning happens on gfx1250, and changes nothing off it.
+        """
+        from torch._inductor.codegen.rocm.ck_conv_template import (
+            CKGroupedConvFwdTemplate,
+        )
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.ir import Buffer, FixedLayout
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        ck_dir = os.environ.get("TORCHINDUCTOR_CK_DIR") or self.ck_dir
+        device = torch.device("cuda")
+        dtype = torch.float32
+
+        # filter_op resolves layouts through V.graph.sizevars, so it needs a
+        # graph context even though nothing is lowered or compiled here.
+        gm = make_fx(lambda: torch.zeros(1))()
+        graph = GraphLowering(gm)
+
+        def gen_ops_for(target_arch):
+            # The shape from test_max_autotune_conv2d_float32: conv2d(x[1,8,224,224],
+            # w[64,8,7,7]) in channels-last.
+            x = Buffer(
+                name="X",
+                layout=FixedLayout(
+                    device, dtype, [1, 8, 224, 224], [401408, 1, 1792, 8]
+                ),
+            )
+            w = Buffer(
+                name="W",
+                layout=FixedLayout(device, dtype, [64, 8, 7, 7], [392, 1, 56, 8]),
+            )
+            out_layout = FixedLayout(
+                device, dtype, [1, 64, 218, 218], [3041536, 1, 13952, 64]
+            )
+            template = CKGroupedConvFwdTemplate(
+                [x, w],
+                out_layout,
+                stride=[1, 1],
+                padding=[0, 0],
+                dilation=[1, 1],
+                groups=1,
+                n_spatial_dimensions=2,
+            )
+            # No cap: compare the whole filtered pool, not a random sample of it.
+            with (
+                config.patch(
+                    {
+                        "max_autotune": True,
+                        "rocm.arch": [target_arch],
+                        "rocm.ck_dir": ck_dir,
+                        "rocm.ck_max_profiling_configs": None,
+                    }
+                ),
+                tf32_off(),
+                V.set_graph_handler(graph),
+            ):
+                return template, template.gen_ops()
+
+        template, ops = gen_ops_for(arch)
+        self.assertGreater(
+            len(ops), 0, f"No CK conv instances survived filter_op for {arch}"
+        )
+
+        if arch == "gfx1250":
+            # Every surviving instance must be one that can actually emit a
+            # kernel. Assert the invariant rather than a count, so this stays
+            # stable as CK adds or removes instances.
+            not_viable = [op for op in ops if not template._wave32_viable(op)]
+            self.assertEqual(
+                not_viable,
+                [],
+                f"{len(not_viable)}/{len(ops)} instances kept for gfx1250 cannot "
+                f"emit a matrix-core kernel; filter_op is letting dead instances "
+                f"through to autotune.",
+            )
+            # The pool must shrink materially. If it ever stops doing so the
+            # predicate has silently become a no-op.
+            _, unpruned = gen_ops_for("gfx950")
+            self.assertLess(
+                len(ops),
+                len(unpruned),
+                "gfx1250 pruning kept as many instances as the unpruned gfx950 "
+                "pool; the viability predicate is not doing anything.",
+            )
+            # Golden values, independent of the predicate. The assertions above
+            # are self-referential -- `ops` came out of filter_op, which calls
+            # _wave32_viable, so "every kept op is viable" holds even if the
+            # predicate is gutted. These two numbers come from per-instance
+            # compile-and-disassemble of every f32 conv instance on gfx1250, and
+            # are the only thing here that pins the arithmetic itself. If CK ships or
+            # removes conv instances they will need updating -- do that by
+            # re-measuring, not by relaxing the assertion.
+            self.assertEqual(
+                (len(ops), len(unpruned)),
+                (4, 48),
+                "Pruned/unpruned f32 pool for the conv2d shape changed. Expected "
+                "4 of 48 (measured on gfx1250 silicon). If CK's instance set moved, "
+                "re-measure; if not, _wave32_viable no longer matches CK.",
+            )
+            # Direct unit check of the wave mapping, so a gutted _xdl_per_wave
+            # cannot pass. 64/16/16 with 4 waves does not divide; 128/128/16 does.
+            self.assertEqual(template._xdl_per_wave(64, 16, 16, 16, 16, 1), 0)
+            self.assertNotEqual(template._xdl_per_wave(128, 16, 128, 16, 16, 1), 0)
+            # The float32 pool above cannot exercise Wave32Force16MNPerXDL,
+            # which needs a 2-byte compute type -- so check the 16x16 remap
+            # directly.
+            from ck4inductor.grouped_conv_fwd.gen_instances import (
+                gen_conv_ops_library,
+            )
+
+            remapped = [
+                op
+                for op in gen_conv_ops_library()
+                if op.a_element_dtype in ("F16", "BF16")
+                and (op.m_per_xdl, op.n_per_xdl) == (32, 32)
+                and template._wave32_viable(op)
+            ]
+            self.assertGreater(
+                len(remapped),
+                0,
+                "No declared-32x32 f16/bf16 instance passed _wave32_viable, so "
+                "Wave32Force16MNPerXDL is never firing. The 16x16 remap is "
+                "disabled and gfx1250 loses its f16/bf16 conv coverage.",
+            )
+        else:
+            # Off-target the filter must change nothing: everything that
+            # passes the dtype/layout/spec checks is still offered, including
+            # instances gfx1250 would reject. This pins the regression class
+            # where an arch gate keys on the physical device rather than the
+            # compile target.
+            self.assertTrue(
+                any(not template._wave32_viable(op) for op in ops),
+                "Expected the un-gated gfx950 pool to contain instances that "
+                "gfx1250 would prune; if not, this assertion proves nothing.",
+            )
+
+    @unittest.skipIf(not torch.version.hip, "ROCM only")
+    @unittest.mock.patch.dict(os.environ, _test_env)
     @parametrize(
         "max_autotune_gemm_backends",
         ("CK,CKWMMA", "ATen,CK"),
