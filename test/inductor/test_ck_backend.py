@@ -166,7 +166,7 @@ class TestCKBackend(TestCase):
         """
         # CKWMMA is a single-token value: on non-gfx1250 the WMMA gate yields zero
         # choices and there is no ATen fallback in the list, so there is nothing to
-        # select. Skip it off gfx1250 (the two/three-token values degrade fine).
+        # select. Skip it off gfx1250 (the two/three-token values still work).
         if max_autotune_gemm_backends == "CKWMMA":
             runtime_arch = torch.cuda.get_device_properties(0).gcnArchName
             if "gfx1250" not in runtime_arch:
@@ -688,7 +688,7 @@ class TestCKBackend(TestCase):
         instances that survive filtering are all pipeline v2, which the K-loop
         prefetch check rejects at runtime, so every choice scores +inf; CKWMMA
         supplies working candidates. Off gfx1250 the CKWMMA gate is False and the
-        two-token value degrades to plain CK.
+        two-token value falls back to plain CK.
         """
 
         def bmm(a, b):
@@ -805,7 +805,11 @@ class TestCKBackend(TestCase):
             # The synthetic GraphLowering doesn't know our input buffers, so teach
             # V.graph.get_dtype about them. generate() wraps this with its own fake
             # for the output node, delegating unknown names back to this function.
-            dtype_lookup = {"X": dtype, "W": dtype, template.output_node.get_name(): dtype}
+            dtype_lookup = {
+                "X": dtype,
+                "W": dtype,
+                template.output_node.get_name(): dtype,
+            }
 
             with unittest.mock.patch.object(
                 V.graph, "get_dtype", lambda name: dtype_lookup[name]

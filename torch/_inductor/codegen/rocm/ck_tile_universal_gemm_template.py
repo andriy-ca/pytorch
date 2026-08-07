@@ -453,9 +453,7 @@ class CKTileGemmTemplate(CKTileTemplate):
                 ):
                     return alignment
 
-        threads_per_block = (
-            op.warp_m * op.warp_n * op.warp_k * self._threads_per_warp()
-        )
+        threads_per_block = op.warp_m * op.warp_n * op.warp_k * self._threads_per_warp()
         a_elements_per_thread = op.tile_m * op.tile_k / threads_per_block
         b_elements_per_thread = op.tile_n * op.tile_k / threads_per_block
 
@@ -761,8 +759,7 @@ class CKTileGemmTemplate(CKTileTemplate):
             # get_k_warp_tile() is guarded by
             # `#if CK_TILE_USE_WMMA && defined(CK_USE_GFX1250)`.
             version_comment = (
-                "#define CK_TILE_USE_WMMA 1\n"
-                "#define CK_USE_GFX1250\n" + version_comment
+                "#define CK_TILE_USE_WMMA 1\n#define CK_USE_GFX1250\n" + version_comment
             )
 
         return self._template_from_string(self.gemm_template).render(

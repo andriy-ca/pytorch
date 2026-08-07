@@ -2781,9 +2781,7 @@ def _warn_missing_ck_header(header: str) -> None:
         # to a minimal inline path search over the same roots the runtime uses.
         ck_dir = config.rocm.ck_dir or ""
         rocm_home = (
-            os.environ.get("ROCM_HOME")
-            or os.environ.get("ROCM_PATH")
-            or "/opt/rocm"
+            os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH") or "/opt/rocm"
         )
         roots = [
             os.path.join(ck_dir, "include"),
