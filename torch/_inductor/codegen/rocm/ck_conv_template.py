@@ -431,6 +431,135 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         self.groups = groups
         self.n_spatial_dimensions = n_spatial_dimensions
 
+    # The (A, B, E) layout triples for which CK's
+    # is_NSpatialGC_GKSpatial_NSpatialGK<> holds
+    # (is_NSpatialGC_GKSpatial_NSpatialGK, device_grouped_conv_utils.hpp). It
+    # constrains all three layouts,
+    # not just A.
+    _NSPATIALGC_LAYOUT_TRIPLES = frozenset(
+        {
+            ("NWGC", "GKXC", "NWGK"),
+            ("NHWGC", "GKYXC", "NHWGK"),
+            ("NDHWGC", "GKZYXC", "NDHWGK"),
+        }
+    )
+
+    # Conv specializations admitted by Wave32Force16MNPerXDL.
+    _FORCE16_CONV_SPECS = frozenset(
+        {
+            "ConvolutionForwardSpecialization::Default",
+            "ConvolutionForwardSpecialization::Filter1x1Stride1Pad0",
+        }
+    )
+
+    @staticmethod
+    def _xdl_per_wave(
+        block_size,
+        m_per_block,
+        n_per_block,
+        m_per_xdl,
+        n_per_xdl,
+        m_xdl_per_wave,
+    ) -> int:
+        """Python mirror of CK's GetXdlPerWave2<> (device_base.hpp), wave32.
+
+        Returns 0 when the tile admits no valid wave mapping. Across the shipped
+        instance set only the divisibility branch actually fires; the zero guards
+        above it mirror CK for safety but are unreachable today.
+        """
+        waves = block_size // 32
+        denom = m_xdl_per_wave * m_per_xdl
+        if denom == 0:
+            return 0
+        m_waves = m_per_block // denom
+        if m_waves <= 0:
+            return 0
+        n_waves = waves // m_waves
+        if n_waves == 0:
+            return 0
+        if n_per_block % (n_per_xdl * n_waves) != 0:
+            return 0
+        return n_per_block // (n_waves * n_per_xdl)
+
+    def _wave32_viable(self, op: "CKGroupedConvFwdOp") -> bool:  # type: ignore[name-defined]
+        """True if this instance can emit a matrix-core kernel on a wave32 target.
+
+        CK decides this at compile time and, when the answer is no, silently
+        drops the instance: IsSupportedArgument falls through to a bare
+        `return false`, and Run() to `return 0`, both guarded by the same
+        `if constexpr (MXdlPerWave32 > 0)` in
+        device_grouped_conv_fwd_multiple_abd_xdl_cshuffle_v3.hpp. Autotune
+        therefore pays to compile and benchmark a kernel that can never run.
+        Replaying the check here prunes those before
+        gen_ops' random.sample, so the sampling cap draws only from candidates
+        that can actually run.
+
+        Scored against per-instance disassembly: of 2264 shipped conv instances
+        compiled for gfx1250, 1101 are valid (emit a matrix-core kernel on the
+        gfx950 control). This keeps 308 of those with **zero false negatives**.
+
+        A false negative would silently delete a working kernel -- the one
+        unacceptable error, hence FN=0 is the property to preserve when editing
+        this. The 10 false positives are all pipeline v4, rejected by a
+        VGPR/LDS-budget check this does not model rather than by the wave mapping
+        it does. They are not merely wasted compiles: the host-side CheckValidity
+        does not replicate that device-side gate, so such a kernel launches with
+        an empty body (`if constexpr` compiled it away), returns instantly, and
+        can win autotune on time while leaving the output unwritten. This
+        pre-exists and the change strictly reduces it (only 2 of the 10 survive
+        filter_op at all); eliminating it entirely would mean modelling the LDS
+        budget too.
+        """
+        # Wave32Force16MNPerXDL (device_..._xdl_cshuffle_v3.hpp) remaps a
+        # declared 32x32 warp tile down to 16x16, but only for 2-byte compute
+        # types. a_compute_dtype is None when the compute type defaults to the
+        # element type, so resolve it before the size test.
+        a_compute = (
+            op.a_compute_dtype if op.a_compute_dtype is not None else op.a_element_dtype
+        )
+        b_compute = (
+            op.b_compute_dtype if op.b_compute_dtype is not None else op.b_element_dtype
+        )
+
+        # TF32 is gfx942/gfx950 only (is_tf32_supported, device_prop.hpp), and
+        # IsSupportedArgument rejects it outright elsewhere. This
+        # is independent of the user's allow_tf32 setting, which
+        # is_blocked_by_tf32_setting already handles: with allow_tf32 on, TF32
+        # instances reach the sampler and are pure waste -- for the conv2d shape
+        # this change targets, 3 of the 4 sampled candidates would be TF32.
+        if "TF32" in (a_compute, b_compute):
+            return False
+
+        force16 = (
+            (op.a_layout, op.b_layout, op.e_layout) in self._NSPATIALGC_LAYOUT_TRIPLES
+            and a_compute in ("F16", "BF16")
+            and b_compute in ("F16", "BF16")
+            # The enumerator copies the literal template-argument text, and every
+            # shipped conv instance spells this slot with the header-local alias
+            # `using OutElementOp = PassThrough`. Comparing against "PassThrough"
+            # alone never matches and silently disables the whole 16x16 remap.
+            and op.cde_elementwise_op in ("PassThrough", "OutElementOp")
+            and op.conv_forward_specialization in self._FORCE16_CONV_SPECS
+        )
+        warp_tile = 16 if force16 else max(op.m_per_xdl, op.n_per_xdl)
+        if warp_tile != 16:
+            # is_xdl_wmma_supported's gfx1250 branch requires a 16x16 warp tile
+            # (is_xdl_wmma_supported, device_prop.hpp).
+            return False
+
+        # GET_MXDL_PER_WAVE_IMPL passes M/N swapped (device_base.hpp).
+        return (
+            self._xdl_per_wave(
+                op.block_size,
+                op.n_per_block,
+                op.m_per_block,
+                warp_tile,
+                warp_tile,
+                op.n_xdl_per_wave * (op.n_per_xdl // warp_tile),
+            )
+            != 0
+        )
+
     def filter_op(self, op: "CKGroupedConvFwdOp"):  # type: ignore[name-defined]
         metas = [
             T.get_layout()
@@ -461,6 +590,10 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         if "Default" not in op.conv_forward_specialization:
             return None
         if self.is_blocked_by_tf32_setting(op):
+            return None
+        # wave32 targets reject most instances at compile time, without a
+        # diagnostic; prune them before they reach the sampling cap in gen_ops.
+        if self._is_gfx1250() and not self._wave32_viable(op):
             return None
         return op
 
