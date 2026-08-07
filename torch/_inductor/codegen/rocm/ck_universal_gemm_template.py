@@ -1074,29 +1074,6 @@ class CKWMMAGemmTemplate(CKGemmTemplate):
             else "ck_wmma_gemm_template"
         )
 
-    def _target_arch(self) -> str:
-        """Base gfx arch string of the *compile target*, or "" if undeterminable.
-
-        Must match the arch ``compile_command`` passes to ``--offload-arch``
-        (``config.rocm.arch``), NOT the physical runtime device -- otherwise WMMA
-        source can be rendered for one arch and compiled for another. Precedence
-        mirrors ``use_ck_template``: ``config.rocm.arch`` wins, the native device
-        arch is only a fallback.
-        """
-        if config.rocm.arch:
-            return config.rocm.arch[0].split(":")[0]
-
-        from ...utils import _rocm_native_device_arch_name
-
-        for node in (self.output_node, *self.input_nodes):
-            device = node.get_layout().device
-            if device is not None and device.type == "cuda":
-                return _rocm_native_device_arch_name(device).split(":")[0]
-        return ""
-
-    def _is_gfx1250(self) -> bool:
-        return self._target_arch() == "gfx1250"
-
     def header(self) -> IndentedBuffer:
         # CK_USE_WMMA must be defined BEFORE any CK header is included.
         # ck/host_utility/flush_cache.hpp guards an XDL-only debug block with

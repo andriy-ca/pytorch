@@ -2,6 +2,7 @@ from typing import Any
 from typing_extensions import override
 
 import torch
+from torch._inductor import config
 from torch._inductor.codegen.rocm.rocm_template import ROCmTemplate
 from torch._inductor.ir import IRNode
 from torch._inductor.utils import IndentedBuffer
@@ -26,6 +27,36 @@ class CKTemplate(ROCmTemplate):
         torch.float8_e5m2fnuz: "BF8",  # gfx94
         torch.float8_e5m2: "BF8",  # gfx95
     }
+
+    def _target_arch(self) -> str:
+        """Base gfx arch string (e.g. "gfx1250") of the *compile target*, or "" if
+        it cannot be determined.
+
+        This must match the arch that ``compile_command`` passes to
+        ``--offload-arch`` (``config.rocm.arch``), NOT the physical runtime
+        device -- otherwise the rendered source (WMMA macros, warp tile) can be
+        emitted for one arch and compiled for another. The native device arch is
+        only a fallback when it is unset.
+        """
+        if config.rocm.arch:
+            # A fat multi-arch list (e.g. gfx942;gfx950;gfx1250) is genuinely
+            # ambiguous -- compile_command emits --offload-arch for every entry --
+            # so taking the first is only exact for the single-arch case the
+            # autotune path actually uses. Callers that gate arch-specific
+            # behaviour on this take the non-matching branch when the list is
+            # fat, which is the safe direction.
+            return config.rocm.arch[0].split(":")[0]
+
+        from ...utils import _rocm_native_device_arch_name
+
+        for node in (self.output_node, *self.input_nodes):
+            device = node.get_layout().device
+            if device is not None and device.type == "cuda":
+                return _rocm_native_device_arch_name(device).split(":")[0]
+        return ""
+
+    def _is_gfx1250(self) -> bool:
+        return self._target_arch() == "gfx1250"
 
     @staticmethod
     def is_blocked_by_tf32_setting(op) -> bool:

@@ -302,6 +302,10 @@ class CKTileGemmTemplate(CKTileTemplate):
             layout=layout,
         )
 
+    # NOTE: CKTileTemplate and CKTemplate are siblings (both derive from
+    # ROCmTemplate), so this cannot be inherited from CKTemplate's copy. Keep the
+    # two in sync: reversing the compile-target-first precedence makes a gfx1250
+    # host emit WMMA source that is then compiled for a different arch.
     def _target_arch(self) -> str:
         """Base gfx arch string (e.g. "gfx1250") of the *compile target*, or "" if
         it cannot be determined.
