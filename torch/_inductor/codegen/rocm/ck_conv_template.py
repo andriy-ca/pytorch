@@ -368,10 +368,10 @@ class CKGroupedConvFwdTemplate(CKTemplate):
     def header(self) -> IndentedBuffer:
         res = super().header()
         res.splice(
-            """
+            f"""
                 // CK conv headers
 
-                #include "ck/tensor_operation/gpu/device/impl/device_grouped_conv_fwd_multiple_abd_xdl_cshuffle_v3.hpp"
+                #include "{self._DEVICE_OP_HEADER}"
                 #include "ck/tensor_operation/gpu/device/convolution_forward_specialization.hpp"
                 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
 
@@ -621,12 +621,20 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         )
         return chosen_instances
 
+    # The CK device op this template renders through. The WMMA subclass overrides
+    # both of these; everything else in the render path is shared.
+    _DEVICE_OP_STRUCT = "DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3"
+    _DEVICE_OP_HEADER = (
+        "ck/tensor_operation/gpu/device/impl/"
+        "device_grouped_conv_fwd_multiple_abd_xdl_cshuffle_v3.hpp"
+    )
+
     def emit_ck_instance(self, op: "CKGroupedConvFwdOp") -> tuple[str, str]:  # type: ignore[name-defined]
         # The Jinja template for generating a C++ type alias *definition* for a Universal GEMM instance
         template_definition = r"""
     // Gemm operator {{operation_name}}
     using Operation_{{operation_name}} =
-        ck::tensor_operation::device::DeviceGroupedConvFwdMultipleABD_Xdl_CShuffle_V3<
+        ck::tensor_operation::device::{{struct_name}}<
             {{template_params}}>;
 
 """
@@ -651,6 +659,7 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         return self._template_from_string(template_definition).render(
             operation_name=op.name(),
             template_params=(",\n" + 12 * " ").join(template_params),
+            struct_name=self._DEVICE_OP_STRUCT,
         ), self._template_from_string(template_type).render(operation_name=op.name())
 
     def render(  # type: ignore[override]
@@ -754,3 +763,109 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         Helper method to retrieve runtime args from generate kwargs
         """
         return []
+
+
+class CKWMMAGroupedConvFwdTemplate(CKGroupedConvFwdTemplate):
+    """gfx1250 WMMA grouped-convolution-forward backend.
+
+    Enumerates CK's purpose-built WMMA conv instances (all 16x16 warp tile,
+    f16/bf16) rather than the XDL instances that merely happen to lower to WMMA.
+    Opt-in via the ``CKWMMA`` token in ``max_autotune_conv_backends``; the ``CK``
+    token continues to enumerate XDL only, on every arch.
+
+    CK ships **no f32 WMMA conv instance**, so this contributes nothing for f32 --
+    including for the f32 conv2d case that the arch-aware ``filter_op`` pruning
+    fixes. The two are independent.
+    """
+
+    _DEVICE_OP_STRUCT = "DeviceGroupedConvFwdMultipleABD_Wmma_CShuffle_V3"
+    _DEVICE_OP_HEADER = (
+        "ck/tensor_operation/gpu/device/impl/"
+        "device_grouped_conv_fwd_multiple_abd_wmma_cshuffle_v3.hpp"
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Distinguish WMMA from XDL conv choices in kernel_hash_name, call_name()
+        # and the autotune log; the base __init__ hardcodes "ck_conv_template".
+        self.name = "ck_wmma_conv_template"
+
+    def header(self) -> IndentedBuffer:
+        # CK_USE_WMMA must be defined BEFORE any CK header is included.
+        # CK_USE_WMMA is normally a cmake knob in ck/config.h, which the
+        # ck4inductor wheel does not ship, so relying on $ROCM_HOME to
+        # supply it would make this build-environment dependent.
+        res = IndentedBuffer()
+        res.splice(
+            """
+                // CK WMMA build switch (see comment in CKWMMAGemmTemplate.header)
+                #ifndef CK_USE_WMMA
+                #define CK_USE_WMMA 1
+                #endif
+            """
+        )
+        res.splice(super().header().getvalue())
+        return res
+
+    def gen_ops(self):
+        """Enumerate the shipped WMMA conv instances, capped independently of the
+        classic ``CK`` pool via ``ck_wmma_max_profiling_configs``."""
+        # The lowering gate already restricts this to gfx1250, but enforce it here
+        # too so the template is safe to construct directly and can never emit
+        # WMMA source for a non-WMMA compile target.
+        if not self._is_gfx1250():
+            return []
+
+        try:
+            from ck4inductor.grouped_conv_fwd.gen_instances import (  # type: ignore[import]
+                gen_conv_ops_library_wmma,
+            )
+        except ImportError:
+            # Older ck4inductor wheel without the WMMA conv enumerator: return no
+            # WMMA choices rather than failing the compile.
+            return []
+
+        filtered_instances = list(
+            filter(lambda op: self.filter_op(op), gen_conv_ops_library_wmma())
+        )
+        random.seed(-11)
+        cap = config.rocm.ck_wmma_max_profiling_configs
+        chosen_instances = (
+            random.sample(filtered_instances, min(len(filtered_instances), cap))
+            if cap
+            else filtered_instances
+        )
+        log.debug(
+            "generated %d ck wmma conv instances after filter: %s",
+            len(chosen_instances),
+            chosen_instances,
+        )
+        return chosen_instances
+
+    @staticmethod
+    def add_ck_wmma_conv_choices(
+        choices,
+        layout,
+        input_nodes,
+        *,
+        stride,
+        padding,
+        dilation,
+        groups,
+        n_spatial_dimensions,
+    ):
+        """Add gfx1250 WMMA grouped-conv instance choices to the auto-tuning list."""
+        template = CKWMMAGroupedConvFwdTemplate(
+            input_nodes,
+            layout,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            n_spatial_dimensions=n_spatial_dimensions,
+        )
+        for op in template.gen_ops():
+            template.maybe_append_choice(
+                choices,
+                op=op,
+            )
