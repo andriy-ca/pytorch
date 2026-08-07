@@ -5,7 +5,10 @@ import logging
 from typing import TYPE_CHECKING, TypedDict
 
 import torch
-from torch._inductor.codegen.rocm.ck_conv_template import CKGroupedConvFwdTemplate
+from torch._inductor.codegen.rocm.ck_conv_template import (
+    CKGroupedConvFwdTemplate,
+    CKWMMAGroupedConvFwdTemplate,
+)
 
 from .. import config, ir
 from ..lowering import (
@@ -27,6 +30,7 @@ from ..utils import (
     pad_listlike,
     sympy_product,
     use_ck_conv_template,
+    use_ck_wmma_conv_template,
     use_triton_template,
 )
 from ..virtualized import V
@@ -747,6 +751,19 @@ def convolution(
 
     if use_ck_conv_template(layout):
         CKGroupedConvFwdTemplate.add_ck_conv_choices(
+            choices,
+            layout,
+            input_nodes=(x, weight) + ((bias,) if bias is not None else tuple()),
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            n_spatial_dimensions=ndim,
+        )
+
+    # Independent of the CK token above: CKWMMA is opt-in and never implied by CK.
+    if use_ck_wmma_conv_template(layout):
+        CKWMMAGroupedConvFwdTemplate.add_ck_wmma_conv_choices(
             choices,
             layout,
             input_nodes=(x, weight) + ((bias,) if bias is not None else tuple()),

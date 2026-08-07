@@ -2895,6 +2895,24 @@ def use_ck_conv_template(layout: Layout) -> bool:
     return enabled
 
 
+def use_ck_wmma_conv_template(layout: Layout) -> bool:
+    enabled = (
+        # NB: conv reads max_autotune_conv_backends via _use_conv_autotune_backend,
+        # a different config key from the GEMM path. Using _use_autotune_backend
+        # here would make the CKWMMA token permanently unreachable for conv.
+        _use_conv_autotune_backend("CKWMMA")
+        and use_ck_template(layout)
+        # WMMA conv instances only exist for gfx1250. Gate on the compile target,
+        # not the runtime device, so WMMA source is never emitted for a non-WMMA
+        # arch -- a gfx1250 host cross-compiling for gfx950 must not take this path.
+        and _ck_compile_target_arch(layout) == "gfx1250"
+    )
+    if enabled:
+        _warn_missing_ck_header("ck/ck.hpp")
+        _warn_missing_ck_header("ck/config.h")
+    return enabled
+
+
 def _use_template_for_cpu(layout: Layout) -> bool:
     return (
         config.max_autotune or config.max_autotune_gemm
