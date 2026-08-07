@@ -627,9 +627,16 @@ class TestCKBackend(TestCase):
     @parametrize(
         "max_autotune_conv_backends",
         ("CK", "ATEN,CK"),
-        name_fn=lambda b: "standalone" if b == "CK" else "fallback",
+        # Not the GEMM tests' standalone/fallback labels. Conv appends ATen
+        # whenever the choice list comes back empty (the `if not choices` branch
+        # in conv.py), so the "CK" case is never standalone; and ATEN in the
+        # token list makes ATen a competitor up front, not a fallback.
+        name_fn=lambda b: "ck_only" if b == "CK" else "vs_aten",
     )
-    def test_max_autotune_conv2d(self, max_autotune_conv_backends):
+    def test_max_autotune_conv2d_float32(self, max_autotune_conv_backends):
+        """Float32 conv2d. Dtype is in the name because f32 and f16/bf16 take
+        materially different CK paths on gfx1250: Wave32Force16MNPerXDL requires
+        2-byte compute types, so f32 never gets the 16x16 warp-tile remap."""
         tensor_options = {"device": "cuda", "dtype": torch.float32}
 
         x = torch.randn(1, 8, 224, 224, **tensor_options)
