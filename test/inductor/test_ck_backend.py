@@ -37,6 +37,11 @@ log = logging.getLogger(__name__)
 _test_env = {}
 
 
+# How many CK instances the conv autotune tests sample. The production default is
+# None (uncapped); these tests cap it to keep compile time down.
+_CONV_PROFILING_CONFIGS = 6
+
+
 # A selected CK kernel is emitted into the generated wrapper as an
 # `async_compile.rocm(...)` block defining a `rocm_fused_*` kernel that is then
 # called (see torch/_inductor/codegen/rocm/rocm_kernel.py). A green assert_close
@@ -889,8 +894,8 @@ class TestCKBackend(TestCase):
                     "max_autotune_conv_backends": max_autotune_conv_backends,
                     "compile_threads": 4,
                     "rocm.ck_dir": self.ck_dir,
-                    "rocm.ck_max_profiling_configs": 4,
-                    "rocm.ck_wmma_max_profiling_configs": 4,
+                    "rocm.ck_max_profiling_configs": _CONV_PROFILING_CONFIGS,
+                    "rocm.ck_wmma_max_profiling_configs": _CONV_PROFILING_CONFIGS,
                 }
             ),
             tf32_off(),
