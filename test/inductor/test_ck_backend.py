@@ -251,10 +251,16 @@ class TestCKBackend(TestCase):
     @unittest.mock.patch.dict(os.environ, _test_env)
     def test_ck_selected_smoke_mm_bf16(self):
         """
-        Tier-1 smoke: on the runtime GPU, force the standalone CK backend for a
-        small bf16 mm and assert a CK kernel is actually selected (not an ATen or
-        Triton fallback) and produces correct numerics. Cheapest unambiguous
-        signal that the CK path is reachable and a matrix-core kernel runs.
+        Tier-1 smoke: on the runtime GPU, force the CK backends for a small bf16
+        mm and assert a CK kernel is actually selected (not an ATen or Triton
+        fallback) and produces correct numerics. Cheapest unambiguous signal that
+        the CK path is reachable and a matrix-core kernel runs.
+
+        The token is the two-token "CK,CKWMMA" for the same reason the addmm and
+        matmul tests use it: on gfx1250 the classic XDL instances are largely
+        rejected at runtime, and with no ATEN in the list a GEMM lowering has
+        nothing to fall back to, so a bare "CK" raises NoValidChoicesError there.
+        CKWMMA is gfx1250-gated and inert elsewhere, so gfx9 still exercises XDL.
         """
 
         def mm(a, b):
@@ -271,7 +277,7 @@ class TestCKBackend(TestCase):
             config.patch(
                 {
                     "max_autotune": True,
-                    "max_autotune_gemm_backends": "CK",
+                    "max_autotune_gemm_backends": "CK,CKWMMA",
                     "compile_threads": 4,
                     "rocm.ck_max_profiling_configs": 4,
                     "rocm.ck_dir": self.ck_dir,
